@@ -23,6 +23,7 @@ async-trait = { workspace = true }
 reqwest = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = { workspace = true }

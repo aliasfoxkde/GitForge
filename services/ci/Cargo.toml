@@ -13,6 +13,7 @@ path = "src/main.rs"
 gitforge-common = { path = "../../crates/gitforge-common" }
 gitforge-db = { path = "../../crates/gitforge-db" }
 gitforge-events = { path = "../../crates/gitforge-events" }
+sqlx = { version = "0.9", features = ["runtime-tokio", "sqlite", "uuid", "chrono"] }
 gitforge-metrics = { path = "../../crates/gitforge-metrics" }
 gitforge-ci = { path = "../../crates/gitforge-ci" }
 gitforge-scheduler = { path = "../../crates/gitforge-scheduler" }

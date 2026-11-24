@@ -257,13 +257,34 @@ async fn get_pipeline(
 /// risk; the remaining hazard is option smuggling, which the leading
 /// `-` rejection closes. The character set covers branches, tags,
 /// `refs/...` paths, commit hashes, and `~`/`^` history expressions.
+///
+/// **Forbidden syntax:** `{`, `}`, and `:` are rejected outright.
+/// These characters are exclusively used by git's reflog syntax
+/// (`HEAD~{u}`, `HEAD~{commit}`), pathspec syntax (`file:Makefile`),
+/// and named-reference syntax (`HEAD:Makefile`). None of these belong
+/// in a revision that is resolved to a commit hash — allowing them
+/// would let a pipeline author or webhook consumer read arbitrary blobs
+/// or traverse reflog entries that are not commit references.
+///
+/// Tilde (`~`) and caret (`^`) are accepted only when followed by
+/// digits (the standard `~3` / `~{3}`-style history walk). The `^`
+/// suffix (e.g., `HEAD^2` for the Nth parent) is also safe because
+/// it operates on commit parents, not refs or blobs.
 fn is_safe_revision(revision: &str) -> bool {
-    !revision.is_empty()
-        && !revision.starts_with('-')
-        && revision.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric()
-                || matches!(byte, b'.' | b'_' | b'/' | b'-' | b'~' | b'^' | b':')
-        })
+    if revision.is_empty() || revision.starts_with('-') {
+        return false;
+    }
+    // Reject known dangerous ref prefixes (e.g. refs/meta/config, refs/replace/)
+    if revision.starts_with("refs/meta/") || revision.starts_with("refs/replace/") {
+        return false;
+    }
+    // Reject reflog pathspec syntax ({}, :) and any other dangerous constructs
+    if revision.contains(['{', '}', ':']) {
+        return false;
+    }
+    revision.bytes().all(|byte| {
+        byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'/' | b'-' | b'~' | b'^')
+    })
 }
 
 /// Resolve a revision to a commit hash in the repository's bare storage.
@@ -1579,5 +1600,74 @@ mod tests {
         assert_eq!(json["started_at"], serde_json::Value::Null);
         assert_eq!(json["finished_at"], serde_json::Value::Null);
         assert_eq!(json["name"], "build");
+    }
+    /// Safe revision expressions that should pass validation.
+    #[test]
+    fn is_safe_revision_accepts_valid() {
+        // Branch names
+        assert!(is_safe_revision("main"));
+        assert!(is_safe_revision("develop"));
+        assert!(is_safe_revision("feature/fix-bug"));
+        assert!(is_safe_revision("feature/my-fix"));
+        // Tag names
+        assert!(is_safe_revision("v1.0.0"));
+        assert!(is_safe_revision("release-2026.11"));
+        // Commit hashes
+        assert!(is_safe_revision("abc123def456"));
+        // Ref paths
+        assert!(is_safe_revision("refs/heads/main"));
+        assert!(is_safe_revision("refs/tags/v1.0.0"));
+        // History expressions with ~ and ^
+        assert!(is_safe_revision("HEAD~2"));
+        assert!(is_safe_revision("HEAD^2"));
+        assert!(is_safe_revision("v1.0.0~5"));
+        // Dot-separated refs
+        assert!(is_safe_revision("foo.bar.baz"));
+        // Underscores and dashes
+        assert!(is_safe_revision("my_commit-name"));
+    }
+
+    /// Dangerous revision expressions that must be rejected.
+    #[test]
+    fn is_safe_revision_rejects_dangerous() {
+        // Reflog syntax ({}, :) — allows reading arbitrary reflog entries
+        assert!(!is_safe_revision("HEAD~{u}"));
+        assert!(!is_safe_revision("HEAD~{commit}"));
+        assert!(!is_safe_revision("HEAD{commit}"));
+        // Pathspec syntax (:) — allows reading arbitrary blobs
+        assert!(!is_safe_revision("HEAD:Makefile"));
+        assert!(!is_safe_revision("HEAD:src/main.rs"));
+        assert!(!is_safe_revision("refs/meta/config"));
+        assert!(!is_safe_revision("abc:def"));
+        // Option smuggling
+        assert!(!is_safe_revision("--help"));
+        assert!(!is_safe_revision("-n"));
+        // Braces alone
+        assert!(!is_safe_revision("{abc}"));
+        assert!(!is_safe_revision("{"));
+        assert!(!is_safe_revision("}"));
+        // Empty
+        assert!(!is_safe_revision(""));
+    }
+
+    /// Edge cases for is_safe_revision.
+    #[test]
+    fn is_safe_revision_edge_cases() {
+        // Single character — safe
+        assert!(is_safe_revision("a"));
+        // Leading numbers — safe (commit hashes can start with any hex char)
+        assert!(is_safe_revision("123abc"));
+        // Long ref path — safe
+        assert!(is_safe_revision("refs/heads/very/long/nested/branch/path"));
+        // Mixed safe characters — safe
+        assert!(is_safe_revision("v1.0.0-beta.123"));
+        // Only tilde/caret at end — safe (e.g., HEAD^ means first parent)
+        assert!(is_safe_revision("HEAD^"));
+        assert!(is_safe_revision("HEAD~"));
+        // Special chars that should be rejected
+        assert!(!is_safe_revision("HEAD&ls"));
+        assert!(!is_safe_revision("HEAD|cat"));
+        assert!(!is_safe_revision("HEAD;rm -rf"));
+        assert!(!is_safe_revision("HEAD`whoami`"));
     }
 }

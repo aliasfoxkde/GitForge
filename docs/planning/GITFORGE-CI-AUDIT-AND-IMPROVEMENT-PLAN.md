@@ -249,10 +249,11 @@ the container.
   `~/.cache/gitforge`, else `/var/cache/gitforge`). The runner creates the
   host directory itself, as its own user, because the daemon would create
   a missing bind source as root — unwritable for the job's user.
-- A cache mount that cannot be prepared degrades to a cold build with a
-  runner-side warning. It is an optimisation, never a correctness
-  requirement, and a missing cache directory must not turn into a red
-  pipeline.
+- A mount that cannot be prepared fails the job. The runner reports it
+  as an infrastructure failure, so the reason reaches the job's own
+  result instead of a log line (GF-10, 2026-11-05: a job whose cache had
+  vanished used to run cold, time out, and show nothing about the mount
+  that was missing).
 
 **Measured on the Fedora instance (2026-10-22), clippy/test/coverage job
 durations:**

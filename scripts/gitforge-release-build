@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# Build the four release binaries from a checkout and install them into the
+# release source root.
+#
+# Usage: gitforge-release-build <source-root> [target-dir]
+#
+# The bundler copies the release binaries from the root of the source root,
+# where they live in gitignored paths. This script is how they get there: it
+# builds them from the checkout, refuses any binary that does not report the
+# commit the checkout is on, and only then installs it. A binary built from
+# another commit never reaches the source root.
+#
+# The build must run in a git checkout: the binaries are stamped with their
+# commit at build time (crates/gitforge-common/build.rs). For a build from a
+# source copy without a checkout, set GITFORGE_BUILD_COMMIT to the commit the
+# copy was made from, and GITFORGE_BUILD_DIRTY to the state of that copy; the
+# same stamp check then applies.
+#
+# Builds belong on the build host with the spare NVMe, not on the instance
+# that runs the services.
+set -euo pipefail
+
+source_root="${1:-}"
+target_dir="${2:-}"
+
+if [[ -z "$source_root" ]]; then
+  echo 'usage: gitforge-release-build <source-root> [target-dir]' >&2
+  exit 64
+fi
+
+if [[ ! -d "$source_root" ]]; then
+  printf 'release build: source root does not exist: %s\n' "$source_root" >&2
+  exit 1
+fi
+
+expected_commit="${GITFORGE_BUILD_COMMIT:-}"
+if [[ -z "$expected_commit" ]]; then
+  expected_commit=$(git -C "$source_root" rev-parse HEAD 2>/dev/null || true)
+fi
+if [[ ! "$expected_commit" =~ ^[0-9a-f]{40}$ ]]; then
+  printf 'release build: the source root must be a git checkout, or GITFORGE_BUILD_COMMIT must name the commit\n' >&2
+  exit 1
+fi
+
+if [[ -z "$target_dir" ]]; then
+  target_dir="$source_root/target"
+fi
+
+# Pin the commit for the build so the binaries cannot drift from it: the
+# build script stamps this value into every binary it compiles.
+export GITFORGE_BUILD_COMMIT="$expected_commit"
+export CARGO_TARGET_DIR="$target_dir"
+
+# Pin how the build happened as well. The bundle's metadata describes the
+# artifact, so the toolchain and the build time have to be the ones the
+# BUILD used - not the ones of whichever host assembles the bundle
+# (GF-15, 2026-11-06). The build script stamps both into every binary.
+export GITFORGE_BUILD_TOOLCHAIN="${GITFORGE_BUILD_TOOLCHAIN:-$(rustc --version 2>/dev/null || true)}"
+export GITFORGE_BUILD_EPOCH="${GITFORGE_BUILD_EPOCH:-$(date -u +%s)}"
+
+printf 'release build: building %s from %s\n' "$expected_commit" "$source_root"
+cargo build --release --manifest-path "$source_root/Cargo.toml" \
+  -p api -p ci -p git-server -p runner
+
+built_dir="$target_dir/release"
+
+# The stamp check is the point of this script: a binary that does not report
+# the commit it was built from is never installed.
+"$(dirname "$0")/gitforge-release-stamps" "$built_dir" "$expected_commit"
+
+for binary in api ci git-server runner; do
+  install -m 0755 "$built_dir/$binary" "$source_root/$binary"
+done
+
+printf 'release build: installed %d binaries into %s\n' 4 "$source_root"

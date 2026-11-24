@@ -74,6 +74,10 @@ CREATE TABLE jobs (
     name TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'queued', 'assigned', 'running', 'succeeded', 'failed', 'cancelled', 'timed_out')),
     runner_id UUID,
+    workspace_path TEXT,
+    container_working_dir TEXT,
+    step_working_directories JSONB NOT NULL DEFAULT '[]'::jsonb,
+    working_dir TEXT,
     started_at TIMESTAMPTZ,
     finished_at TIMESTAMPTZ,
     retry_count INT NOT NULL DEFAULT 0,
@@ -92,10 +96,21 @@ CREATE TABLE runners (
     status TEXT NOT NULL DEFAULT 'online' CHECK (status IN ('online', 'busy', 'offline')),
     last_heartbeat TIMESTAMPTZ,
     capacity INT NOT NULL DEFAULT 1,
+    storage_domain TEXT NOT NULL DEFAULT 'default',
+    paused BOOLEAN NOT NULL DEFAULT FALSE,
+    pause_generation BIGINT NOT NULL DEFAULT 0,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 CREATE INDEX idx_runners_status ON runners(status);
+
+CREATE TABLE runner_drain_receipts (
+    runner_id UUID PRIMARY KEY REFERENCES runners(id) ON DELETE CASCADE,
+    generation BIGINT NOT NULL,
+    active_job_ids JSONB NOT NULL DEFAULT '[]'::jsonb,
+    owned_container_ids JSONB NOT NULL DEFAULT '[]'::jsonb,
+    acknowledged_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
 
 -- Artifacts
 CREATE TABLE artifacts (

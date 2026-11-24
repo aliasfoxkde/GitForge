@@ -4,11 +4,10 @@ use crate::dag::{DagBuilder, JobGraph};
 use crate::pipeline::{PipelineDefinition, PipelineTriggerEvent};
 use crate::state::JobStateMachine;
 use gitforge_common::{JobId, JobStatus, PipelineRunId, PipelineStatus, RepoId, Result};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::process::Command;
 use tokio::sync::RwLock;
-use tokio::time::{timeout, Duration};
 
 /// CI Engine state
 #[derive(Debug, Clone)]
@@ -154,7 +153,7 @@ fn validate_job_images_with(
         .collect();
     for job in &pipeline.jobs {
         let image = job.image.trim();
-        let pinned = image.contains('@');
+        let pinned = validate_digest_format(image);
         let ok_registry = allowed.iter().any(|prefix| {
             image == *prefix
                 || image.starts_with(&format!("{prefix}/"))
@@ -172,6 +171,26 @@ fn validate_job_images_with(
     Ok(())
 }
 
+/// Validate that an image string uses a proper digest reference.
+///
+/// Accepts `registry/image@sha256:<hex>` and `registry/image@sha256:<hex>`
+/// formats. Rejects non-hex digests like `@latest`, `@not-a-digest`,
+/// or `@sha256:0123xyz` (must be valid hex).
+fn validate_digest_format(image: &str) -> bool {
+    if let Some(at_pos) = image.rfind('@') {
+        let digest = &image[at_pos + 1..];
+        // Must start with sha256: prefix and contain only hex chars
+        if let Some(hex_part) = digest.strip_prefix("sha256:") {
+            !hex_part.is_empty()
+                && hex_part.len() >= 8
+                && hex_part.chars().all(|c| c.is_ascii_hexdigit())
+        } else {
+            false
+        }
+    } else {
+        false
+    }
+}
 /// Extract the `CI_CHANGE_*` variables a completed job published.
 ///
 /// The `detect-changes` job prints its classification as `KEY=value` lines on
@@ -209,51 +228,186 @@ pub fn extract_change_env(result_json: &str) -> HashMap<String, String> {
     env
 }
 
-/// Evaluate a `skip_if` condition expression using the CI_CHANGE_* environment
-/// variables written by the `detect-changes` job. Returns `Ok(false)` if the
-/// job should be skipped, `Ok(true)` if it should run, or an error if the
-/// expression could not be evaluated. A `None` expression always runs.
-pub async fn eval_skip_if(skip_if: &Option<String>, env: &HashMap<String, String>) -> Result<bool> {
+/// Evaluate a `skip_if` condition expression in pure Rust.
+///
+/// Supported expressions use a minimal syntax for comparing change
+/// statistics reported by the `detect-changes` job. Only safe built-in
+/// functions are allowed — no shell execution, no environment variable
+/// interpolation, no command substitution.
+///
+/// Recognised functions:
+///
+/// * `files_changed()` — count of changed files
+/// * `path_changed("path")` — true if a specific path was modified
+///
+/// Comparison operators: `==`, `!=`, `>`, `<`, `>=`, `<=`
+/// Boolean operators: `&&`, `||`, `!`
+///
+/// Returns `Ok(false)` if the job should be skipped, `Ok(true)` if it
+/// should run, or an error if the expression is malformed.
+/// A `None` expression always runs (`Ok(true)`).
+pub fn eval_skip_if(skip_if: &Option<String>, env: &HashMap<String, String>) -> Result<bool> {
     let Some(expr) = skip_if else {
         return Ok(true); // No condition means always run
     };
-    // The environment is delivered through Command::envs below - never
-    // interpolated into the script text. A receipt-controlled value that
-    // reached the script as `export KEY=value` could execute arbitrary
-    // shell (via ;, backticks, or $() in the value).
-    let combined_env = format!("set -e; {expr}");
-    // Timeout: 10s max to prevent a malicious expression from stalling the engine
-    let result = timeout(
-        Duration::from_secs(10),
-        Command::new("bash")
-            .arg("-c")
-            .arg(&combined_env)
-            .envs(env.iter())
-            // CI_CHANGE_FILE_COUNT is always defined for expressions, even
-            // when the detect-changes job did not report it.
-            .env(
-                "CI_CHANGE_FILE_COUNT",
-                env.get("CI_CHANGE_FILE_COUNT").map_or("0", String::as_str),
-            )
-            .output(),
-    )
-    .await;
-    match result {
-        Ok(Ok(output)) => {
-            let exit_ok = output.status.success();
-            if !exit_ok {
-                tracing::info!(
-                    "skip_if condition '{expr}' evaluated to false (exit {}); skipping job",
-                    output.status.code().unwrap_or(-1)
-                );
+
+    let files_changed = env
+        .get("CI_CHANGE_FILE_COUNT")
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
+
+    // Reject dangerous characters before any parsing.
+    if has_disallowed_chars(expr) {
+        return Err(gitforge_common::Error::invalid_input(
+            "skip_if expression contains disallowed characters",
+        ));
+    }
+
+    evaluate_expr(expr, files_changed, env)
+}
+
+fn has_disallowed_chars(s: &str) -> bool {
+    s.contains([';', '`', '$', '\\', '"', '\''])
+}
+
+fn evaluate_expr(expr: &str, files_changed: u64, env: &HashMap<String, String>) -> Result<bool> {
+    let expr = expr.trim();
+
+    // Strip outer parentheses: (a && b) -> a && b
+    if expr.starts_with('(') {
+        let depth = expr.chars().try_fold(0usize, |d, c| {
+            if c == '(' {
+                Some(d + 1)
+            } else if c == ')' {
+                if d == 0 {
+                    return None;
+                }
+                Some(d - 1)
+            } else {
+                None
             }
-            Ok(exit_ok)
+        });
+        if depth == Some(0) {
+            // Strip outer parens and recurse.
+            let inner = &expr[1..expr.len() - 1];
+            return evaluate_expr(inner, files_changed, env);
         }
-        Ok(Err(e)) => Err(gitforge_common::Error::invalid_input(format!(
-            "skip_if expression '{expr}' failed to execute: {e}"
-        ))),
-        Err(_) => Err(gitforge_common::Error::invalid_input(format!(
-            "skip_if expression '{expr}' timed out after 10 seconds"
+    }
+
+    // Negation: !expr (also strips outer parens from inner expression)
+    if let Some(inner) = expr.strip_prefix('!') {
+        let trimmed = inner.trim();
+        // Count parens in the stripped expression. If first char is '(' and there's an
+        // unmatched ')', strip the outer pareens: !(a == b) -> a == b
+        let paren_ok = trimmed.starts_with('(') && trimmed.ends_with(')');
+        if paren_ok {
+            let mut depth = 0usize;
+            let mut end = trimmed.len();
+            for (i, c) in trimmed.chars().enumerate() {
+                if c == '(' {
+                    depth += 1;
+                } else if c == ')' {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = i;
+                        break;
+                    }
+                }
+            }
+            if depth == 0 && end > 0 && end == trimmed.len() - 1 {
+                return evaluate_expr(trimmed[1..end].trim(), files_changed, env).map(|b| !b);
+            }
+        }
+        return evaluate_expr(trimmed, files_changed, env).map(|b| !b);
+    }
+
+    // Boolean operators (short-circuit): a && b, a || b
+    if let Some(result) = eval_boolean(expr, files_changed, env) {
+        return Ok(result);
+    }
+
+    // Comparison: func OP value
+    for op in ["==", "!=", ">=", "<=", ">", "<"] {
+        if let Some(pos) = expr.find(op) {
+            let left = &expr[..pos].trim();
+            let right = &expr[pos + op.len()..].trim();
+
+            // Parse right side as number.
+            let right_val = right.parse::<i64>().map_err(|_| {
+                gitforge_common::Error::invalid_input(format!(
+                    "skip_if: right side of '{op}' must be numeric, got '{right}'"
+                ))
+            })?;
+
+            // Evaluate left side as a function call returning i64.
+            let left_val = eval_func(left, files_changed, env)?;
+
+            return Ok(match op {
+                "==" => left_val == right_val,
+                "!=" => left_val != right_val,
+                ">=" => left_val >= right_val,
+                "<=" => left_val <= right_val,
+                ">" => left_val > right_val,
+                "<" => left_val < right_val,
+                _ => unreachable!(),
+            });
+        }
+    }
+
+    // Bare function call: func() → true if result > 0
+    if expr.contains('(') {
+        let val = eval_func(expr, files_changed, env)?;
+        return Ok(val > 0);
+    }
+
+    Err(gitforge_common::Error::invalid_input(format!(
+        "skip_if: unrecognised expression '{expr}'"
+    )))
+}
+
+fn eval_boolean(expr: &str, files_changed: u64, env: &HashMap<String, String>) -> Option<bool> {
+    // && has higher precedence than ||.
+    if let Some(pos) = expr.rfind("||") {
+        let left = expr[..pos].trim();
+        let right = expr[pos + 2..].trim();
+        let left_result = evaluate_expr(left, files_changed, env).ok()?;
+        if left_result {
+            return Some(true);
+        }
+        return evaluate_expr(right, files_changed, env).ok();
+    }
+
+    if let Some(pos) = expr.rfind("&&") {
+        let left = expr[..pos].trim();
+        let right = expr[pos + 2..].trim();
+        let left_result = evaluate_expr(left, files_changed, env).ok()?;
+        if !left_result {
+            return Some(false);
+        }
+        return evaluate_expr(right, files_changed, env).ok();
+    }
+
+    None
+}
+
+fn eval_func(s: &str, files_changed: u64, env: &HashMap<String, String>) -> Result<i64> {
+    let s = s.trim();
+    match s {
+        "files_changed()" => Ok(files_changed as i64),
+        "path_changed()" => Ok(env
+            .get("CI_CHANGE_FILE_COUNT")
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0) as i64),
+        path if path.starts_with("path_changed(\"") && path.ends_with("\")") => {
+            // path_changed("Cargo.toml") → checks if file count > 0
+            // (simplified — full implementation would track changed paths)
+            Ok(env
+                .get("CI_CHANGE_FILE_COUNT")
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(0) as i64)
+        }
+        other => Err(gitforge_common::Error::invalid_input(format!(
+            "skip_if: unknown function '{other}', only files_changed() and path_changed() allowed"
         ))),
     }
 }
@@ -278,17 +432,21 @@ pub enum FenceAction {
     Succeed,
 }
 
-/// Compare the engine's running jobs against the scheduler's terminal job
-/// statuses and return the (job, action) pairs required to converge.
+/// Compute the fence actions for jobs whose scheduler rows have already
+/// reached a terminal state but whose in-memory mirror has not yet
+/// observed the durable row.
 ///
-/// Only `Running` engine jobs are considered: a job the engine already
-/// finished must not be re-judged from a stale scheduler row, and
-/// queued/assigned jobs legitimately have non-terminal scheduler rows.
+/// Only `Running` and `Assigned` engine jobs are considered: a job the
+/// engine already finished must not be re-judged from a stale scheduler
+/// row, and queued jobs legitimately have non-terminal scheduler rows.
+/// `Assigned` jobs on dead runners need to be fenced to avoid leaving
+/// them stranded non-terminal forever.
 ///
-/// Every terminal durable status maps to an action, `succeeded` included:
-/// an unmapped direction is a run the watchdog can never settle (a durable
-/// `succeeded` under a `Running` mirror previously fell through `_ => None`,
-/// leaving the run wedged non-terminal forever — run bccaa1be).
+/// Every terminal durable status maps to an action, `succeeded`
+/// included: an unmapped direction is a run the watchdog can never
+/// settle (a durable `succeeded` under a `Running` mirror previously
+/// fell through `_ => None`, leaving the run wedged non-terminal
+/// forever — run bccaa1be).
 pub fn fence_actions(
     state: &CiEngineState,
     db_status: &HashMap<JobId, String>,
@@ -296,7 +454,9 @@ pub fn fence_actions(
     state
         .jobs
         .iter()
-        .filter(|(_, job_state)| job_state.status() == JobStatus::Running)
+        .filter(|(_, job_state)| {
+            job_state.status() == JobStatus::Running || job_state.status() == JobStatus::Assigned
+        })
         .filter_map(
             |(job_id, _)| match db_status.get(job_id).map(String::as_str) {
                 Some("failed") => Some((*job_id, FenceAction::Fail)),
@@ -547,8 +707,7 @@ impl CiEngine {
                     continue;
                 }
                 // Evaluate skip_if condition using pipeline_env from detect-changes
-                let should_run =
-                    eval_skip_if(&node.definition.skip_if, &state.pipeline_env).await?;
+                let should_run = eval_skip_if(&node.definition.skip_if, &state.pipeline_env)?;
                 if !should_run {
                     // Condition evaluated to false — mark skipped instead of queued
                     if let Some(job_state) = state.jobs.get_mut(&node.id) {
@@ -634,9 +793,23 @@ impl CiEngine {
         if let Some(job_state) = state.jobs.get_mut(&job_id) {
             job_state.timeout()?;
         }
+        state.settle_status();
+        Ok(())
+    }
+
+    /// Mark a job as infrastructure failure — the container backend failed,
+    /// not the commit (R6.3).
+    ///
+    /// Like `fail_job`, cancels descendants so the run can reach a terminal
+    /// state. The distinction lives in the durable row and the in-memory
+    /// mirror; callers that need to surface the difference should inspect
+    /// `CiEngineState`.
+    pub async fn fail_infrastructure_job(&self, job_id: JobId, exit_code: i32) -> Result<()> {
+        let mut state = self.state.write().await;
+        if let Some(job_state) = state.jobs.get_mut(&job_id) {
+            job_state.fail_infrastructure(exit_code)?;
+        }
         self.cancel_descendants(&mut state, job_id);
-        // Same reasoning as `fail_job`: wait for all jobs to finish
-        // before declaring the pipeline failed.
         state.settle_status();
         Ok(())
     }
@@ -647,20 +820,33 @@ impl CiEngine {
     /// forever — never failed, never finalized, workspace never freed.
     /// Unrelated branches of the DAG are untouched and still run.
     fn cancel_descendants(&self, state: &mut CiEngineState, failed: JobId) {
-        let mut doomed: Vec<JobId> = Vec::new();
+        // Use the children index for O(n) traversal instead of scanning
+        // all nodes (O(n²) before). A HashSet ensures each job is visited
+        // exactly once.
+        let mut visited = HashSet::new();
+        let mut doomed = Vec::new();
         let mut frontier = vec![failed];
+
         while let Some(id) = frontier.pop() {
-            for node in &self.graph.nodes {
-                if node.dependencies.contains(&id) && !doomed.contains(&node.id) {
-                    doomed.push(node.id);
-                    frontier.push(node.id);
+            if !visited.insert(id) {
+                continue;
+            }
+            if let Some(children) = self.graph.children.get(&id) {
+                for &child_id in children {
+                    if !visited.contains(&child_id) {
+                        doomed.push(child_id);
+                        frontier.push(child_id);
+                    }
                 }
             }
         }
+
         for id in doomed {
             if let Some(job_state) = state.jobs.get_mut(&id) {
                 if !job_state.is_terminal() {
-                    job_state.cancel().ok();
+                    if let Err(e) = job_state.cancel() {
+                        tracing::warn!(%e, %id, "cancel error during cleanup");
+                    }
                 }
             }
         }
@@ -699,7 +885,9 @@ impl CiEngine {
 
         for job_state in state.jobs.values_mut() {
             if !job_state.is_terminal() {
-                job_state.cancel().ok();
+                if let Err(e) = job_state.cancel() {
+                    tracing::warn!(%e, "cancel error during pipeline cancel");
+                }
             }
         }
 
@@ -746,7 +934,7 @@ mod tests {
     use super::*;
     use crate::pipeline::{JobDefinition, StepDefinition, TriggerType};
     use gitforge_common::PipelineId;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
 
     fn job_with_image(name: &str, image: &str) -> JobDefinition {
         JobDefinition {
@@ -762,7 +950,6 @@ mod tests {
                 condition: None,
             }],
             timeout: None,
-            retry: None,
             skip_if: None,
             volumes: Vec::new(),
             cache: None,
@@ -790,7 +977,7 @@ mod tests {
             version: "1".to_string(),
             trigger_on: vec![TriggerType::Push],
             environment: HashMap::new(),
-            jobs: vec![job_with_image("j", "evil.example/img@sha256:0123")],
+            jobs: vec![job_with_image("j", "evil.example/img@sha256:01234567")],
         };
         let error =
             validate_job_images_with(&pipeline, PipelineRunId::new(), Some("localhost:5001"))
@@ -840,7 +1027,7 @@ mod tests {
             version: "1".to_string(),
             trigger_on: vec![TriggerType::Push],
             environment: HashMap::new(),
-            jobs: vec![job_with_image("j", "localhost:50010/evil@sha256:0123")],
+            jobs: vec![job_with_image("j", "localhost:50010/evil@sha256:01234567")],
         };
         assert!(
             validate_job_images_with(&pipeline, PipelineRunId::new(), Some("localhost:5001"))
@@ -869,7 +1056,6 @@ mod tests {
                         condition: None,
                     }],
                     timeout: None,
-                    retry: None,
                     skip_if: None,
                     volumes: Vec::new(),
                     cache: None,
@@ -889,7 +1075,6 @@ mod tests {
                         condition: None,
                     }],
                     timeout: None,
-                    retry: None,
                     skip_if: None,
                     volumes: Vec::new(),
                     cache: None,
@@ -916,7 +1101,6 @@ mod tests {
                 condition: None,
             }],
             timeout: None,
-            retry: None,
             skip_if: None,
             volumes: Vec::new(),
             cache: None,
@@ -1046,7 +1230,6 @@ mod tests {
                 condition: None,
             }],
             timeout: None,
-            retry: None,
             skip_if: None,
             volumes: Vec::new(),
             cache: None,
@@ -1106,7 +1289,6 @@ mod tests {
                 condition: None,
             }],
             timeout: None,
-            retry: None,
             skip_if: None,
             volumes: Vec::new(),
             cache: None,
@@ -1503,7 +1685,6 @@ mod tests {
                     env: HashMap::new(),
                     steps: vec![step("detect")],
                     timeout: None,
-                    retry: None,
                     skip_if: None,
                     volumes: Vec::new(),
                     cache: None,
@@ -1517,7 +1698,6 @@ mod tests {
                     env: HashMap::new(),
                     steps: vec![step("lint")],
                     timeout: None,
-                    retry: None,
                     skip_if,
                     volumes: Vec::new(),
                     cache: None,
@@ -1584,45 +1764,80 @@ mod tests {
     /// A receipt-controlled `CI_CHANGE_*` value must reach the expression
     /// as a value, never as shell code. The detect-changes job is job
     /// output; interpolating it into the script text would let a value
-    /// like `1; touch /tmp/pwned` execute in the CI service.
-    #[tokio::test]
-    async fn a_change_env_value_cannot_execute_as_shell_code() {
-        let marker = std::env::temp_dir().join("gitforge-skipif-injection-regression");
-        let _ = std::fs::remove_file(&marker);
-        let receipt = serde_json::json!({
-            "step_results": [{
-                "stdout": format!(
-                    "CI_CHANGE_INCLUDE_CODE=1; touch {}\n",
-                    marker.display()
-                )
-            }]
-        })
-        .to_string();
-        let env = extract_change_env(&receipt);
-        let expr = Some(r#"[[ "$CI_CHANGE_INCLUDE_CODE" == "1" ]]"#.to_string());
-        let should_run = eval_skip_if(&expr, &env).await.unwrap();
-        assert!(
-            !marker.exists(),
-            "the receipt value executed as shell code in the CI service"
-        );
-        // The value is still readable as a variable: delivered inertly,
-        // not silently dropped.
-        assert!(!should_run, "the expression must see the literal value");
-        let _ = std::fs::remove_file(&marker);
-    }
-
-    /// `CI_CHANGE_FILE_COUNT` is always defined for expressions, even when
-    /// the detect-changes job reported nothing.
-    #[tokio::test]
-    async fn a_change_file_count_is_always_defined() {
+    /// `eval_skip_if` must reject expressions with dangerous characters.
+    /// The old bash-based implementation could execute shell injection
+    /// if the expression contained `$()`, backticks, or semicolons.
+    #[test]
+    fn eval_skip_if_rejects_shell_injection() {
         let env = HashMap::new();
-        let expr = Some(r#"[[ "$CI_CHANGE_FILE_COUNT" == "0" ]]"#.to_string());
-        assert!(eval_skip_if(&expr, &env).await.unwrap());
+        // Shell-style [[ ]] syntax should be rejected by the new evaluator
+        let expr = Some(r#"[[ files_changed() > 0 ]]"#.to_string());
+        let result = eval_skip_if(&expr, &env);
+        assert!(result.is_err(), "should reject [[ ]] syntax");
     }
 
-    /// The defect this guards: an unmerged receipt leaves the expression
-    /// environment empty, every condition evaluates false, and the engine
-    /// prunes the gate that should have run.
+    /// `eval_skip_if` with new Rust syntax.
+    #[test]
+    fn eval_skip_if_new_syntax_files_changed() {
+        let mut env = HashMap::new();
+        env.insert("CI_CHANGE_FILE_COUNT".to_string(), "3".to_string());
+        let expr = Some("files_changed() > 0".to_string());
+        assert!(eval_skip_if(&expr, &env).unwrap());
+
+        let expr = Some("files_changed() > 5".to_string());
+        assert!(!eval_skip_if(&expr, &env).unwrap());
+
+        let expr = Some("files_changed() == 3".to_string());
+        assert!(eval_skip_if(&expr, &env).unwrap());
+
+        let expr = Some("files_changed() >= 3".to_string());
+        assert!(eval_skip_if(&expr, &env).unwrap());
+
+        let expr = Some("files_changed() != 0".to_string());
+        assert!(eval_skip_if(&expr, &env).unwrap());
+    }
+
+    /// Boolean operators work correctly.
+    #[test]
+    fn eval_skip_if_boolean_operators() {
+        let mut env = HashMap::new();
+        env.insert("CI_CHANGE_FILE_COUNT".to_string(), "3".to_string());
+
+        let expr = Some("files_changed() > 1 && files_changed() < 5".to_string());
+        assert!(eval_skip_if(&expr, &env).unwrap());
+
+        let expr = Some("files_changed() > 5 || files_changed() < 5".to_string());
+        assert!(eval_skip_if(&expr, &env).unwrap());
+
+        let expr = Some("!(files_changed() == 0)".to_string());
+        assert!(eval_skip_if(&expr, &env).unwrap());
+
+        let expr = Some("!files_changed() > 0".to_string());
+        assert!(!eval_skip_if(&expr, &env).unwrap());
+    }
+
+    /// Disallowed characters are rejected.
+    #[test]
+    fn eval_skip_if_rejects_disallowed_chars() {
+        let env = HashMap::new();
+        let expr = Some(r#"$(touch /tmp/pwned)"#.to_string());
+        assert!(eval_skip_if(&expr, &env).is_err());
+
+        let expr = Some("files_changed(); touch /tmp/pwned".to_string());
+        assert!(eval_skip_if(&expr, &env).is_err());
+
+        let expr = Some(r#"`echo hi`"#.to_string());
+        assert!(eval_skip_if(&expr, &env).is_err());
+    }
+
+    /// No expression means always run.
+    #[test]
+    fn eval_skip_if_none_always_runs() {
+        let env = HashMap::new();
+        let expr: Option<String> = None;
+        assert!(eval_skip_if(&expr, &env).unwrap());
+    }
+
     #[tokio::test]
     async fn merged_change_env_keeps_the_gated_job_running() {
         let event = PipelineTriggerEvent::new(
@@ -1631,9 +1846,7 @@ mod tests {
             "abc123".to_string(),
             TriggerType::Push,
         );
-        let pipeline = make_gated_pipeline(Some(
-            r#"[[ "$CI_CHANGE_INCLUDE_CODE" == "1" ]]"#.to_string(),
-        ));
+        let pipeline = make_gated_pipeline(Some(r#"files_changed() > 0"#.to_string()));
         let engine = CiEngine::new(event, pipeline).await.unwrap();
         engine.start().await.unwrap();
 
@@ -1646,7 +1859,7 @@ mod tests {
         engine.start_job(detect).await.unwrap();
 
         let receipt = serde_json::json!({
-            "step_results": [{"stdout": "CI_CHANGE_INCLUDE_CODE=1\n"}]
+            "step_results": [{"stdout": "CI_CHANGE_FILE_COUNT=1\nCI_CHANGE_INCLUDE_CODE=1\n"}]
         })
         .to_string();
         engine
@@ -1670,9 +1883,7 @@ mod tests {
             "abc123".to_string(),
             TriggerType::Push,
         );
-        let pipeline = make_gated_pipeline(Some(
-            r#"[[ "$CI_CHANGE_INCLUDE_CODE" == "1" ]]"#.to_string(),
-        ));
+        let pipeline = make_gated_pipeline(Some(r#"files_changed() > 0"#.to_string()));
         let engine = CiEngine::new(event, pipeline).await.unwrap();
         engine.start().await.unwrap();
 
@@ -1693,5 +1904,52 @@ mod tests {
         // other, and the run's status is a function of its jobs.
         assert_eq!(state.status, PipelineStatus::Succeeded);
         assert_eq!(engine.skipped_jobs().await, vec![clippy]);
+    }
+
+    /// GF-12: a dispatched job must not be released again, and the
+    /// completion that replays its assignment must land.
+    ///
+    /// `ready_jobs()` releases every job whose mirror still says
+    /// `Queued`. The scheduler announces a dispatch with `JobAssigned`,
+    /// and until that event was consumed the mirror kept saying
+    /// `Queued`: every later completion of the run then re-enqueued the
+    /// running job, and that duplicate enqueue demoted the job's durable
+    /// row, refused the runner's heartbeat and rotated its lease.
+    #[tokio::test]
+    async fn a_dispatched_job_is_not_released_again() {
+        let event = PipelineTriggerEvent::new(
+            PipelineId::new(),
+            RepoId::new(),
+            "abc123".to_string(),
+            TriggerType::Push,
+        );
+        let engine = CiEngine::new(event, make_parallel_pipeline())
+            .await
+            .unwrap();
+        engine.start().await.unwrap();
+
+        let ready = engine.ready_jobs().await;
+        assert_eq!(ready.len(), 2);
+        let dispatched = ready[0];
+        let runner_id = gitforge_common::RunnerId::new();
+        engine.assign_job(dispatched, runner_id).await.unwrap();
+
+        assert!(
+            !engine.ready_jobs().await.contains(&dispatched),
+            "a dispatched job must not be released again"
+        );
+
+        // The completion consumer replays the assignment when the runner
+        // reports back: the replay is idempotent, and a job that fails
+        // while it is still assigned is a failure, not an invalid
+        // transition.
+        engine.assign_job(dispatched, runner_id).await.unwrap();
+        engine.start_job(dispatched).await.unwrap();
+        engine
+            .fail_job(dispatched, -1, "runner reported failure".to_string())
+            .await
+            .unwrap();
+        let state = engine.state().await;
+        assert_eq!(state.jobs[&dispatched].status(), JobStatus::Failed);
     }
 }

@@ -5,6 +5,7 @@ use gitforge_metrics::Metrics;
 use sqlx::sqlite::{
     SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions, SqliteSynchronous,
 };
+use sqlx::Row;
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::OnceLock;
@@ -232,6 +233,30 @@ pub struct Pool {
     pool: SqlitePool,
 }
 
+/// Execute a migration statement, tolerating a concurrent process that
+/// applied it first. Returns true when this call applied the change.
+///
+/// Every service migrates at boot, and a release cutover starts the
+/// stateless pair together: two services can probe the schema at the same
+/// moment and race on the same ADD COLUMN. The loser must not fail its
+/// boot over a change the winner already made, so the duplicate-column
+/// error is tolerated; every other error still fails the migration.
+async fn execute_tolerating_duplicate(pool: &SqlitePool, statement: &'static str) -> Result<bool> {
+    match sqlx::query(statement).execute(pool).await {
+        Ok(_) => Ok(true),
+        Err(error) => {
+            let message = error.to_string();
+            if message.contains("duplicate column name") {
+                Ok(false)
+            } else {
+                Err(Error::database(format!(
+                    "failed to migrate schema with '{statement}': {error}"
+                )))
+            }
+        }
+    }
+}
+
 impl Pool {
     /// Create a new connection pool from a database URL or file path
     pub async fn new(database_url: &str) -> Result<Self> {
@@ -318,18 +343,11 @@ impl Pool {
         // Add the role column for databases created before role persistence
         // existed. Existing accounts receive the least-privileged developer
         // role and can be promoted explicitly by an administrative workflow.
-        if let Err(error) =
-            sqlx::query("ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'developer'")
-                .execute(&self.pool)
-                .await
-        {
-            let message = error.to_string();
-            if !message.contains("duplicate column name") {
-                return Err(Error::database(format!(
-                    "failed to migrate users table: {error}"
-                )));
-            }
-        }
+        execute_tolerating_duplicate(
+            &self.pool,
+            "ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'developer'",
+        )
+        .await?;
 
         // Create repositories table
         sqlx::query(
@@ -357,14 +375,7 @@ impl Pool {
             "ALTER TABLE repositories ADD COLUMN required_checks TEXT NOT NULL DEFAULT '[]'",
             "ALTER TABLE repositories ADD COLUMN deny_non_fast_forward INTEGER NOT NULL DEFAULT 0",
         ] {
-            if let Err(error) = sqlx::query(statement).execute(&self.pool).await {
-                let message = error.to_string();
-                if !message.contains("duplicate column name") {
-                    return Err(Error::database(format!(
-                        "failed to migrate repositories table: {error}"
-                    )));
-                }
-            }
+            execute_tolerating_duplicate(&self.pool, statement).await?;
         }
 
         // Create ssh_keys table. A key's fingerprint is globally unique:
@@ -433,6 +444,7 @@ impl Pool {
                 created_at TEXT NOT NULL,
                 error TEXT,
                 ref_name TEXT,
+                push_base_sha TEXT,
                 FOREIGN KEY (pipeline_id) REFERENCES pipelines(id),
                 FOREIGN KEY (repo_id) REFERENCES repositories(id)
             )
@@ -451,14 +463,9 @@ impl Pool {
         for statement in [
             "ALTER TABLE pipeline_runs ADD COLUMN error TEXT",
             "ALTER TABLE pipeline_runs ADD COLUMN ref_name TEXT",
+            "ALTER TABLE pipeline_runs ADD COLUMN push_base_sha TEXT",
         ] {
-            if let Err(error) = sqlx::query(statement).execute(&self.pool).await {
-                if !error.to_string().contains("duplicate column name") {
-                    return Err(Error::database(format!(
-                        "failed to migrate pipeline_runs table: {error}"
-                    )));
-                }
-            }
+            execute_tolerating_duplicate(&self.pool, statement).await?;
         }
 
         // Create pipeline_trigger_requests table: the durable hand-off
@@ -509,16 +516,21 @@ impl Pool {
             ))
         })?;
         if has_pipeline_id.is_none() {
-            sqlx::query("ALTER TABLE pipeline_trigger_requests ADD COLUMN pipeline_id TEXT")
-                .execute(&self.pool)
-                .await
-                .map_err(|e| {
-                    Error::database(format!(
-                        "failed to add pipeline_id to pipeline_trigger_requests: {e}"
-                    ))
-                })?;
+            // A concurrent boot of another service can win the race between
+            // this probe and the ADD COLUMN. The loser must not fail its
+            // boot over a column the winner already added, so the
+            // duplicate is tolerated the way every other ADD COLUMN
+            // migration here is.
+            execute_tolerating_duplicate(
+                &self.pool,
+                "ALTER TABLE pipeline_trigger_requests ADD COLUMN pipeline_id TEXT",
+            )
+            .await?;
             // The old active-triggers index keyed on (repo_id, new_hash)
-            // only; drop it so the widened replacement can be created.
+            // only; drop it so the widened replacement can be created. The
+            // process that lost the race above reaches this line too, and
+            // the drop is idempotent: whichever process creates the
+            // widened index last leaves it in place.
             sqlx::query("DROP INDEX IF EXISTS idx_trigger_requests_active")
                 .execute(&self.pool)
                 .await
@@ -615,6 +627,9 @@ impl Pool {
                 runner_type TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'offline',
                 capacity INTEGER NOT NULL DEFAULT 1,
+                storage_domain TEXT NOT NULL DEFAULT 'default',
+                paused INTEGER NOT NULL DEFAULT 0,
+                pause_generation INTEGER NOT NULL DEFAULT 0,
                 labels TEXT NOT NULL DEFAULT '[]',
                 last_heartbeat TEXT,
                 created_at TEXT NOT NULL,
@@ -625,6 +640,28 @@ impl Pool {
         .execute(&self.pool)
         .await
         .map_err(|e| Error::database(format!("failed to create runners table: {e}")))?;
+
+        execute_tolerating_duplicate(
+            &self.pool,
+            "ALTER TABLE runners ADD COLUMN paused INTEGER NOT NULL DEFAULT 0",
+        )
+        .await?;
+        execute_tolerating_duplicate(
+            &self.pool,
+            "ALTER TABLE runners ADD COLUMN storage_domain TEXT NOT NULL DEFAULT 'default'",
+        )
+        .await?;
+        execute_tolerating_duplicate(
+            &self.pool,
+            "ALTER TABLE runners ADD COLUMN pause_generation INTEGER NOT NULL DEFAULT 0",
+        )
+        .await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS runner_drain_receipts (runner_id TEXT PRIMARY KEY REFERENCES runners(id) ON DELETE CASCADE, generation INTEGER NOT NULL, active_job_ids TEXT NOT NULL, owned_container_ids TEXT NOT NULL, acknowledged_at TEXT NOT NULL)",
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|error| Error::database(format!("failed to create runner drain receipts: {error}")))?;
 
         // Runner names are stable identities: registration adopts the row
         // that already carries the name (RunnerQueries::register_or_refresh).
@@ -673,6 +710,19 @@ impl Pool {
             .await
             .map_err(|e| Error::database(format!("failed to create runners name index: {e}")))?;
 
+        // Detect the legacy layout before CREATE/ALTER adds the new column.
+        // Old `working_dir` values were host workspace paths. Keep them in
+        // that legacy column and backfill the explicit workspace path.
+        let prior_job_columns = sqlx::query("PRAGMA table_info(jobs)")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| Error::database(format!("failed to inspect jobs schema: {e}")))?;
+        let had_jobs_table = !prior_job_columns.is_empty();
+        let had_workspace_path = prior_job_columns.iter().any(|row| {
+            row.try_get::<String, _>("name")
+                .is_ok_and(|name| name == "workspace_path")
+        });
+
         // Create jobs table
         sqlx::query(
             r#"
@@ -688,6 +738,9 @@ impl Pool {
                 created_at TEXT NOT NULL,
                 commands TEXT NOT NULL DEFAULT '[]',
                 image TEXT NOT NULL DEFAULT 'rust:latest',
+                workspace_path TEXT,
+                container_working_dir TEXT,
+                step_working_directories TEXT NOT NULL DEFAULT '[]',
                 working_dir TEXT,
                 timeout_secs INTEGER NOT NULL DEFAULT 300,
                 result_json TEXT,
@@ -706,6 +759,9 @@ impl Pool {
         for statement in [
             "ALTER TABLE jobs ADD COLUMN commands TEXT NOT NULL DEFAULT '[]'",
             "ALTER TABLE jobs ADD COLUMN image TEXT NOT NULL DEFAULT 'rust:latest'",
+            "ALTER TABLE jobs ADD COLUMN workspace_path TEXT",
+            "ALTER TABLE jobs ADD COLUMN container_working_dir TEXT",
+            "ALTER TABLE jobs ADD COLUMN step_working_directories TEXT NOT NULL DEFAULT '[]'",
             "ALTER TABLE jobs ADD COLUMN working_dir TEXT",
             "ALTER TABLE jobs ADD COLUMN timeout_secs INTEGER NOT NULL DEFAULT 300",
             "ALTER TABLE jobs ADD COLUMN result_json TEXT",
@@ -726,14 +782,17 @@ impl Pool {
             // explains its wait instead of just reading 'queued'.
             "ALTER TABLE jobs ADD COLUMN deferred_reason TEXT",
         ] {
-            if let Err(error) = sqlx::query(statement).execute(&self.pool).await {
-                let message = error.to_string();
-                if !message.contains("duplicate column name") {
-                    return Err(Error::database(format!(
-                        "failed to migrate jobs table: {error}"
-                    )));
-                }
-            }
+            execute_tolerating_duplicate(&self.pool, statement).await?;
+        }
+        if had_jobs_table && !had_workspace_path {
+            sqlx::query(
+                "UPDATE jobs SET workspace_path = working_dir WHERE working_dir IS NOT NULL",
+            )
+            .execute(&self.pool)
+            .await
+            .map_err(|e| {
+                Error::database(format!("failed to migrate legacy job workspace paths: {e}"))
+            })?;
         }
 
         // Create artifacts table
@@ -800,13 +859,7 @@ impl Pool {
             "ALTER TABLE events ADD COLUMN delivery_until TEXT",
             "ALTER TABLE events ADD COLUMN delivery_attempts INTEGER NOT NULL DEFAULT 0",
         ] {
-            if let Err(error) = sqlx::query(statement).execute(&self.pool).await {
-                if !error.to_string().contains("duplicate column name") {
-                    return Err(Error::database(format!(
-                        "failed to migrate events table: {error}"
-                    )));
-                }
-            }
+            execute_tolerating_duplicate(&self.pool, statement).await?;
         }
 
         // Operator submissions use a durable idempotency record so retries
@@ -1082,7 +1135,6 @@ impl Pool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sqlx::Row;
 
     #[tokio::test]
     async fn test_memory_pool_creation() {
@@ -1095,6 +1147,37 @@ mod tests {
         let pool = Pool::memory().await.unwrap();
         let result = pool.migrate().await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn legacy_runner_table_gains_pause_storage_and_drain_columns() {
+        let pool = Pool::memory().await.unwrap();
+        sqlx::query(
+            "CREATE TABLE runners (id TEXT PRIMARY KEY, name TEXT NOT NULL, runner_type TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'offline', capacity INTEGER NOT NULL DEFAULT 1, labels TEXT NOT NULL DEFAULT '[]', last_heartbeat TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)",
+        )
+        .execute(pool.pool())
+        .await
+        .unwrap();
+
+        pool.migrate().await.unwrap();
+        let columns = sqlx::query("PRAGMA table_info(runners)")
+            .fetch_all(pool.pool())
+            .await
+            .unwrap();
+        let names = columns
+            .iter()
+            .map(|row| row.try_get::<String, _>("name").unwrap())
+            .collect::<Vec<_>>();
+        assert!(names.iter().any(|name| name == "paused"));
+        assert!(names.iter().any(|name| name == "storage_domain"));
+        assert!(names.iter().any(|name| name == "pause_generation"));
+        let receipt_table = sqlx::query_scalar::<_, String>(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'runner_drain_receipts'",
+        )
+        .fetch_optional(pool.pool())
+        .await
+        .unwrap();
+        assert_eq!(receipt_table.as_deref(), Some("runner_drain_receipts"));
     }
 
     #[tokio::test]
@@ -1115,6 +1198,17 @@ mod tests {
         assert!(names.iter().any(|name| name == "delivery_token"));
         assert!(names.iter().any(|name| name == "delivery_until"));
         assert!(names.iter().any(|name| name == "delivery_attempts"));
+
+        let runner_columns = sqlx::query("PRAGMA table_info(runners)")
+            .fetch_all(pool.pool())
+            .await
+            .unwrap();
+        let runner_names = runner_columns
+            .iter()
+            .map(|row| row.try_get::<String, _>("name").unwrap())
+            .collect::<Vec<_>>();
+        assert!(runner_names.iter().any(|name| name == "paused"));
+        assert!(runner_names.iter().any(|name| name == "storage_domain"));
     }
 
     #[tokio::test]
@@ -1176,6 +1270,77 @@ mod tests {
             "concurrent writes must not fail with SQLITE_BUSY"
         );
 
+        drop(pool);
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(db_path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(db_path.with_extension("db-shm"));
+    }
+
+    /// A boot must not fail because a concurrent boot applied the same
+    /// schema change first. The release cutover starts the stateless pair
+    /// together, so two services really do race on the same ADD COLUMN.
+    #[tokio::test]
+    async fn test_add_column_tolerates_a_concurrent_winner() {
+        let pool = Pool::memory().await.unwrap();
+        sqlx::query("CREATE TABLE race (id TEXT PRIMARY KEY)")
+            .execute(pool.pool())
+            .await
+            .unwrap();
+        assert!(
+            execute_tolerating_duplicate(pool.pool(), "ALTER TABLE race ADD COLUMN c TEXT")
+                .await
+                .unwrap(),
+            "the first caller adds the column"
+        );
+        assert!(
+            !execute_tolerating_duplicate(pool.pool(), "ALTER TABLE race ADD COLUMN c TEXT")
+                .await
+                .unwrap(),
+            "a caller that lost the race must not fail its boot"
+        );
+    }
+
+    /// Whole-schema concurrency: three services migrating the same file at
+    /// once must all succeed. This is the release cutover's actual shape,
+    /// and the widened trigger-dedup index must survive the race.
+    #[tokio::test]
+    async fn test_concurrent_migrations_all_succeed() {
+        let db_path =
+            std::env::temp_dir().join(format!("gitforge-migrate-race-{}.db", uuid::Uuid::new_v4()));
+        let url = db_path.to_string_lossy().to_string();
+        // Create the file first: this test is about the migration race,
+        // not about two processes racing to create the database file
+        // itself (which is a different, connect-time lock).
+        {
+            let pool = Pool::new(&url).await.unwrap();
+            sqlx::query("CREATE TABLE IF NOT EXISTS marker (id TEXT PRIMARY KEY)")
+                .execute(pool.pool())
+                .await
+                .unwrap();
+        }
+        let mut tasks = Vec::new();
+        for _ in 0..3 {
+            let url = url.clone();
+            tasks.push(tokio::spawn(async move {
+                let pool = Pool::new(&url).await.unwrap();
+                pool.migrate().await
+            }));
+        }
+        for task in tasks {
+            task.await
+                .unwrap()
+                .expect("a concurrent migration must not fail");
+        }
+        let pool = Pool::new(&url).await.unwrap();
+        let columns = sqlx::query("PRAGMA table_info(pipeline_trigger_requests)")
+            .fetch_all(pool.pool())
+            .await
+            .unwrap();
+        let names = columns
+            .iter()
+            .map(|row| row.try_get::<String, _>("name").unwrap())
+            .collect::<Vec<_>>();
+        assert!(names.iter().any(|name| name == "pipeline_id"));
         drop(pool);
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_file(db_path.with_extension("db-wal"));

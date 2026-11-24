@@ -14,8 +14,8 @@ usage() {
 Usage: scripts/qualityctl [--fast] [--json]
 
 Runs format, strict Clippy, workspace tests, and (unless --fast) LLVM
-coverage. Reports are written under target/quality/ and heavy Cargo stages
-run through the GitForge build manager.
+coverage. Reports and captured stage output are written under target/quality/;
+heavy Cargo stages run through the GitForge build manager.
 EOF
 }
 
@@ -40,6 +40,16 @@ mkdir -p "$log_dir"
 if [[ ! -x "$BUILD_CLI" || ! -x "$BUILD_DAEMON" ]]; then
     echo "GitForge manager binaries are missing; build gitforge-build --bins first" >&2
     exit 2
+fi
+
+# The checked-in CLI source may be newer than the local manager binaries.
+# Keep the quality runner usable during that transition; newer managers emit
+# captured stdout/stderr for successful stages, while older ones retain their
+# original result-only behavior.
+SHOW_OUTPUT_ARGS=()
+BUILD_CLI_HELP=$("$BUILD_CLI" --help 2>&1 || true)
+if [[ "$BUILD_CLI_HELP" == *"--show-output"* ]]; then
+    SHOW_OUTPUT_ARGS+=(--show-output)
 fi
 
 daemon_pid=""
@@ -109,7 +119,7 @@ record_stage() {
     local started ended status
     started=$(date -u +%s)
     if timeout --signal=TERM --kill-after=15s "$TIMEOUT_SECONDS" \
-        "$BUILD_CLI" --socket "$SOCKET" --dir "$ROOT" -- "$@" >"$log" 2>&1; then
+        "$BUILD_CLI" "${SHOW_OUTPUT_ARGS[@]}" --socket "$SOCKET" --dir "$ROOT" -- "$@" >"$log" 2>&1; then
         status=passed
     else
         status=failed
@@ -142,8 +152,11 @@ path, failed, json_mode = sys.argv[1:]
 data = json.loads(Path(path).read_text())
 data["status"] = "failed" if failed != "0" else "passed"
 Path(path).write_text(json.dumps(data, indent=2) + "\n")
-if json_mode != "true":
+if json_mode == "true":
     print(json.dumps(data, indent=2))
+else:
+    print(f"qualityctl: {data['status']} ({len(data['stages'])} stages)")
+    print(f"manifest: {path}")
 PY
 
 if [[ "$failed" != 0 ]]; then exit 1; fi

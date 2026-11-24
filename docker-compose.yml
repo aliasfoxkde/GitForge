@@ -138,6 +138,7 @@ services:
       # CI orchestrator with the shared scheduler credential.
       - GITFORGE_CI_TRIGGER_URL=http://ci:42781/pipelines/trigger
       - GITFORGE_CI_TRIGGER_TOKEN=${GITFORGE_SCHEDULER_TOKEN:?set GITFORGE_SCHEDULER_TOKEN in .env}
+      - GITFORGE_CI_TRIGGER_DEAD_LETTER_AFTER=${GITFORGE_CI_TRIGGER_DEAD_LETTER_AFTER:-172800}
     networks:
       - gitforge
 

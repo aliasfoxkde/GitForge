@@ -246,6 +246,9 @@ fn hydrate_pipeline_run(row: sqlx::sqlite::SqliteRow) -> Result<crate::models::P
         ref_name: row
             .try_get("ref_name")
             .map_err(|error| Error::database(format!("invalid pipeline run ref: {error}")))?,
+        push_base_sha: row
+            .try_get("push_base_sha")
+            .map_err(|error| Error::database(format!("invalid pipeline run push base: {error}")))?,
     })
 }
 
@@ -253,6 +256,12 @@ fn hydrate_job(row: sqlx::sqlite::SqliteRow) -> Result<crate::models::Job> {
     let commands: Option<String> = row
         .try_get("commands")
         .map_err(|error| Error::database(format!("invalid job commands column: {error}")))?;
+    let step_working_directories: Option<String> =
+        row.try_get("step_working_directories").map_err(|error| {
+            Error::database(format!(
+                "invalid job step working directories column: {error}"
+            ))
+        })?;
     Ok(crate::models::Job {
         id: JobId::from(parse_uuid_column(&row, "id")?),
         pipeline_run_id: PipelineRunId::from(parse_uuid_column(&row, "pipeline_run_id")?),
@@ -283,6 +292,20 @@ fn hydrate_job(row: sqlx::sqlite::SqliteRow) -> Result<crate::models::Job> {
             .try_get::<Option<String>, _>("image")
             .map_err(|error| Error::database(format!("invalid job image: {error}")))?
             .unwrap_or_else(|| "rust:latest".to_string()),
+        workspace_path: row
+            .try_get("workspace_path")
+            .map_err(|error| Error::database(format!("invalid job workspace path: {error}")))?,
+        container_working_dir: row.try_get("container_working_dir").map_err(|error| {
+            Error::database(format!("invalid job container working directory: {error}"))
+        })?,
+        step_working_directories: serde_json::from_str(
+            &step_working_directories.unwrap_or_else(|| "[]".to_string()),
+        )
+        .map_err(|error| {
+            Error::database(format!(
+                "invalid job step working directories JSON: {error}"
+            ))
+        })?,
         working_dir: row
             .try_get("working_dir")
             .map_err(|error| Error::database(format!("invalid job working directory: {error}")))?,
@@ -325,6 +348,15 @@ fn hydrate_runner(row: sqlx::sqlite::SqliteRow) -> Result<crate::models::Runner>
         capacity: row
             .try_get("capacity")
             .map_err(|error| Error::database(format!("invalid runner capacity: {error}")))?,
+        storage_domain: row
+            .try_get("storage_domain")
+            .map_err(|error| Error::database(format!("invalid runner storage domain: {error}")))?,
+        paused: row
+            .try_get("paused")
+            .map_err(|error| Error::database(format!("invalid runner paused state: {error}")))?,
+        pause_generation: row.try_get("pause_generation").map_err(|error| {
+            Error::database(format!("invalid runner pause generation: {error}"))
+        })?,
         created_at: parse_timestamp_column(&row, "created_at")?,
     })
 }
@@ -829,8 +861,8 @@ impl PipelineQueries {
         .map_err(|e| Error::database(format!("failed to create pipeline: {e}")))?;
         sqlx::query(
             r#"
-            INSERT INTO pipeline_runs (id, pipeline_id, repo_id, status, triggered_by, commit_hash, started_at, finished_at, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO pipeline_runs (id, pipeline_id, repo_id, status, triggered_by, commit_hash, started_at, finished_at, created_at, error, ref_name, push_base_sha)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(run.id.to_string())
@@ -842,6 +874,9 @@ impl PipelineQueries {
         .bind(run.started_at.map(|dt| dt.to_rfc3339()))
         .bind(run.finished_at.map(|dt| dt.to_rfc3339()))
         .bind(run.created_at.to_rfc3339())
+        .bind(&run.error)
+        .bind(&run.ref_name)
+        .bind(&run.push_base_sha)
         .execute(&mut *transaction)
         .await
         .map_err(|e| Error::database(format!("failed to create pipeline run: {e}")))?;
@@ -904,6 +939,13 @@ impl PipelineQueries {
     /// ~7×). Rows already `assigned`/`running` belong to the runner
     /// lifecycle and are left alone; their runs still finalize from the
     /// job outcomes. Returns the number of runs superseded.
+    ///
+    /// "Same pipeline" is the pipeline's logical identity — its name and
+    /// trigger type within the repo — not the `pipelines` row id. The push
+    /// path mints a fresh `PipelineId` and activates a new version row for
+    /// every push, so consecutive pushes of one repo carry different row
+    /// ids on their runs; matching on the row id could therefore never
+    /// reach the previous push's run, and the policy was vacuous.
     pub async fn supersede_stale_runs(
         pool: &Pool,
         repo_id: RepoId,
@@ -913,14 +955,18 @@ impl PipelineQueries {
     ) -> Result<u64> {
         let mut transaction = begin_immediate(pool.pool(), "run supersede").await?;
         let stale: Vec<String> = sqlx::query_scalar(
-            "SELECT id FROM pipeline_runs \
-             WHERE repo_id = ? AND pipeline_id = ? AND id != ? \
-             AND ref_name = ? \
-             AND status IN ('pending', 'running', 'queued') \
-             AND created_at < (SELECT created_at FROM pipeline_runs WHERE id = ?)",
+            "SELECT pr.id FROM pipeline_runs pr \
+             JOIN pipelines p ON p.id = pr.pipeline_id \
+             JOIN pipelines target ON target.id = ? AND target.repo_id = pr.repo_id \
+             WHERE pr.repo_id = ? \
+             AND p.name = target.name AND p.trigger_type = target.trigger_type \
+             AND pr.id != ? \
+             AND pr.ref_name = ? \
+             AND pr.status IN ('pending', 'running', 'queued') \
+             AND pr.created_at < (SELECT created_at FROM pipeline_runs WHERE id = ?)",
         )
-        .bind(repo_id.to_string())
         .bind(pipeline_id.to_string())
+        .bind(repo_id.to_string())
         .bind(keep_run_id.to_string())
         .bind(ref_name)
         .bind(keep_run_id.to_string())
@@ -1038,8 +1084,8 @@ impl PipelineRunQueries {
     pub async fn create(pool: &Pool, run: &crate::models::PipelineRun) -> Result<()> {
         sqlx::query(
             r#"
-            INSERT INTO pipeline_runs (id, pipeline_id, repo_id, status, triggered_by, commit_hash, started_at, finished_at, created_at, error, ref_name)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO pipeline_runs (id, pipeline_id, repo_id, status, triggered_by, commit_hash, started_at, finished_at, created_at, error, ref_name, push_base_sha)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(run.id.to_string())
@@ -1053,6 +1099,7 @@ impl PipelineRunQueries {
         .bind(run.created_at.to_rfc3339())
         .bind(&run.error)
         .bind(&run.ref_name)
+        .bind(&run.push_base_sha)
         .execute(pool.pool())
         .await
         .map_err(|e| Error::database(format!("failed to create pipeline run: {e}")))?;
@@ -1719,8 +1766,8 @@ impl JobQueries {
     pub async fn create(pool: &Pool, job: &crate::models::Job) -> Result<()> {
         sqlx::query(
             r#"
-            INSERT INTO jobs (id, pipeline_run_id, name, status, runner_id, started_at, finished_at, retry_count, created_at, commands, image, working_dir, timeout_secs, result_json, lane, deferred_reason)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO jobs (id, pipeline_run_id, name, status, runner_id, started_at, finished_at, retry_count, created_at, commands, image, workspace_path, container_working_dir, step_working_directories, working_dir, timeout_secs, result_json, lane, deferred_reason)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(job.id.to_string())
@@ -1734,6 +1781,9 @@ impl JobQueries {
         .bind(job.created_at.to_rfc3339())
         .bind(serde_json::to_string(&job.commands).unwrap_or_else(|_| "[]".to_string()))
         .bind(&job.image)
+        .bind(&job.workspace_path)
+        .bind(&job.container_working_dir)
+        .bind(serde_json::to_string(&job.step_working_directories).unwrap_or_else(|_| "[]".to_string()))
         .bind(&job.working_dir)
         .bind(i64::try_from(job.timeout_secs).unwrap_or(i64::MAX))
         .bind(&job.result_json)
@@ -1757,12 +1807,15 @@ impl JobQueries {
     pub async fn create_or_open_queue(pool: &Pool, job: &crate::models::Job) -> Result<()> {
         sqlx::query(
             r#"
-            INSERT INTO jobs (id, pipeline_run_id, name, status, runner_id, started_at, finished_at, retry_count, created_at, commands, image, working_dir, timeout_secs, result_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO jobs (id, pipeline_run_id, name, status, runner_id, started_at, finished_at, retry_count, created_at, commands, image, workspace_path, container_working_dir, step_working_directories, working_dir, timeout_secs, result_json, lane, deferred_reason)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 status = 'queued',
                 commands = excluded.commands,
                 image = excluded.image,
+                workspace_path = excluded.workspace_path,
+                container_working_dir = excluded.container_working_dir,
+                step_working_directories = excluded.step_working_directories,
                 working_dir = excluded.working_dir,
                 timeout_secs = excluded.timeout_secs,
                 lane = excluded.lane,
@@ -1780,6 +1833,9 @@ impl JobQueries {
         .bind(job.created_at.to_rfc3339())
         .bind(serde_json::to_string(&job.commands).unwrap_or_else(|_| "[]".to_string()))
         .bind(&job.image)
+        .bind(&job.workspace_path)
+        .bind(&job.container_working_dir)
+        .bind(serde_json::to_string(&job.step_working_directories).unwrap_or_else(|_| "[]".to_string()))
         .bind(&job.working_dir)
         .bind(i64::try_from(job.timeout_secs).unwrap_or(i64::MAX))
         .bind(&job.result_json)
@@ -1845,6 +1901,33 @@ impl JobQueries {
             .await
             .map_err(|e| Error::database(format!("failed to update job status: {e}")))?;
         Ok(())
+    }
+
+    /// Move a job to `queued`, but only while it is not live.
+    ///
+    /// A job a runner holds is `assigned` or `running`, and that durable
+    /// status is the invariant every later write is fenced by: the
+    /// heartbeat, the start, and the completion are all gated on it. An
+    /// enqueue that demotes such a row to `queued` takes the lease away
+    /// from the runner that holds it - the heartbeat is refused, the row
+    /// becomes dispatchable again, the scheduler rotates the lease token,
+    /// and the completion is rejected (GF-12, measured 2026-11-05 on the
+    /// GitForge CI service: a running job was demoted by a duplicate
+    /// enqueue, and three executions of that job were then rejected with
+    /// `completion_persistence_failed` before the job was fenced as
+    /// `runner_lost_while_running`).
+    ///
+    /// Returns whether a row changed. `false` means the job is live (or
+    /// terminal) and must not be queued again.
+    pub async fn mark_queued_if_dispatchable(pool: &Pool, id: JobId) -> Result<bool> {
+        let result = sqlx::query(
+            "UPDATE jobs SET status = 'queued' WHERE id = ? AND status IN ('pending', 'queued')",
+        )
+        .bind(id.to_string())
+        .execute(pool.pool())
+        .await
+        .map_err(|e| Error::database(format!("failed to mark job queued: {e}")))?;
+        Ok(result.rows_affected() == 1)
     }
 
     /// Cancel every never-dispatched (`pending`/`queued`) job of one run and
@@ -1972,6 +2055,9 @@ impl JobQueries {
             commands,
             image,
             working_dir,
+            None,
+            working_dir,
+            &[],
             timeout_secs,
             gitforge_common::Lane::default(),
         )
@@ -1982,25 +2068,36 @@ impl JobQueries {
     /// (#338). The lane rides the same update as the definition so the
     /// enqueue path writes it once, atomically with the commands it
     /// governs.
+    #[allow(clippy::too_many_arguments)]
     pub async fn set_definition_full(
         pool: &Pool,
         id: JobId,
         commands: &[String],
         image: &str,
+        workspace_path: Option<&str>,
+        container_working_dir: Option<&str>,
         working_dir: Option<&str>,
+        step_working_directories: &[Option<String>],
         timeout_secs: u64,
         lane: gitforge_common::Lane,
     ) -> Result<()> {
         let commands_json = serde_json::to_string(commands)
             .map_err(|e| Error::database(format!("failed to encode job commands: {e}")))?;
+        let step_working_directories_json = serde_json::to_string(step_working_directories)
+            .map_err(|e| {
+                Error::database(format!("failed to encode step working directories: {e}"))
+            })?;
         let timeout_secs = i64::try_from(timeout_secs)
             .map_err(|_| Error::invalid_input("job timeout exceeds database range"))?;
         sqlx::query(
-            "UPDATE jobs SET commands = ?, image = ?, working_dir = ?, timeout_secs = ?, lane = ? WHERE id = ?",
+            "UPDATE jobs SET commands = ?, image = ?, workspace_path = ?, container_working_dir = ?, working_dir = ?, step_working_directories = ?, timeout_secs = ?, lane = ? WHERE id = ?",
         )
             .bind(commands_json)
             .bind(image)
+            .bind(workspace_path)
+            .bind(container_working_dir)
             .bind(working_dir)
+            .bind(step_working_directories_json)
             .bind(timeout_secs)
             .bind(lane.as_str())
             .bind(id.to_string())
@@ -2060,14 +2157,40 @@ impl JobQueries {
         lease_token: &str,
     ) -> Result<bool> {
         let result = sqlx::query(
-            "UPDATE jobs SET runner_id = ?, status = 'assigned', lease_token = ?, lease_generation = lease_generation + 1, deferred_reason = NULL WHERE id = ? AND status IN ('pending', 'queued') AND runner_id IS NULL",
+            "UPDATE jobs SET runner_id = ?, status = 'assigned', lease_token = ?, lease_generation = lease_generation + 1, deferred_reason = NULL WHERE id = ? AND status IN ('pending', 'queued') AND runner_id IS NULL AND EXISTS (SELECT 1 FROM runners WHERE id = ? AND paused = 0)",
         )
         .bind(runner_id.to_string())
         .bind(lease_token)
         .bind(id.to_string())
+        .bind(runner_id.to_string())
         .execute(pool.pool())
         .await
         .map_err(|e| Error::database(format!("failed to assign job lease: {e}")))?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// Return a runner's still-unstarted assignment to the queue only when
+    /// its exact durable lease matches. This is used when host-level
+    /// admission changes after assignment but before the runner claims work.
+    /// A concurrent start wins by changing status to `running`; a stale
+    /// runner or lease cannot requeue another execution.
+    pub async fn defer_assigned_with_lease(
+        pool: &Pool,
+        id: JobId,
+        runner_id: RunnerId,
+        lease_token: &str,
+        reason: &str,
+    ) -> Result<bool> {
+        let result = sqlx::query(
+            "UPDATE jobs SET status = 'queued', runner_id = NULL, started_at = NULL, lease_token = NULL, deferred_reason = ? WHERE id = ? AND status = 'assigned' AND runner_id = ? AND lease_token = ?",
+        )
+        .bind(reason)
+        .bind(id.to_string())
+        .bind(runner_id.to_string())
+        .bind(lease_token)
+        .execute(pool.pool())
+        .await
+        .map_err(|e| Error::database(format!("failed to defer assigned job: {e}")))?;
         Ok(result.rows_affected() == 1)
     }
 
@@ -2105,12 +2228,13 @@ impl JobQueries {
         lease_token: &str,
     ) -> Result<bool> {
         let result = sqlx::query(
-            "UPDATE jobs SET status = 'running', started_at = COALESCE(started_at, ?) WHERE id = ? AND runner_id = ? AND lease_token = ? AND status = 'assigned'",
+            "UPDATE jobs SET status = 'running', started_at = COALESCE(started_at, ?) WHERE id = ? AND runner_id = ? AND lease_token = ? AND status = 'assigned' AND EXISTS (SELECT 1 FROM runners WHERE id = ? AND paused = 0)",
         )
         .bind(Utc::now().to_rfc3339())
         .bind(id.to_string())
         .bind(runner_id.to_string())
         .bind(lease_token)
+        .bind(runner_id.to_string())
         .execute(pool.pool())
         .await
         .map_err(|e| Error::database(format!("failed to start job with lease: {e}")))?;
@@ -2492,13 +2616,7 @@ impl JobQueries {
             let verdict = result_json
                 .as_deref()
                 .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
-                .and_then(|receipt| {
-                    receipt
-                        .get("status")
-                        .and_then(|status| status.as_str())
-                        .and_then(JobStatus::from_str)
-                })
-                .filter(JobStatus::is_terminal)
+                .and_then(|receipt| JobStatus::from_receipt(&receipt))
                 .unwrap_or(JobStatus::Failed);
             let result = sqlx::query(
                 "UPDATE jobs SET status = ?, runner_id = NULL, lease_token = NULL WHERE id = ? AND status IN ('pending', 'queued', 'assigned', 'running') AND finished_at IS NOT NULL",
@@ -2529,6 +2647,16 @@ impl JobQueries {
 
 pub struct RunnerQueries;
 
+/// Runner attestation for one durable pause generation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunnerDrainReceipt {
+    pub runner_id: RunnerId,
+    pub generation: i64,
+    pub active_job_ids: Vec<String>,
+    pub owned_container_ids: Vec<String>,
+    pub acknowledged_at: String,
+}
+
 /// Result of an operator-requested runner retirement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunnerRetirement {
@@ -2552,8 +2680,8 @@ impl RunnerQueries {
     pub async fn create(pool: &Pool, runner: &crate::models::Runner) -> Result<()> {
         sqlx::query(
             r#"
-            INSERT INTO runners (id, name, runner_type, status, capacity, labels, last_heartbeat, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO runners (id, name, runner_type, status, capacity, storage_domain, paused, labels, last_heartbeat, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(runner.id.to_string())
@@ -2561,6 +2689,8 @@ impl RunnerQueries {
         .bind(&runner.runner_type)
         .bind(&runner.status)
         .bind(runner.capacity)
+        .bind(&runner.storage_domain)
+        .bind(runner.paused)
         .bind("[]") // labels as JSON array
         .bind(runner.last_heartbeat.map(|dt| dt.to_rfc3339()))
         .bind(runner.created_at.to_rfc3339())
@@ -2608,11 +2738,12 @@ impl RunnerQueries {
             };
 
             sqlx::query(
-                "UPDATE runners SET runner_type = ?, status = ?, capacity = ?, labels = ?, last_heartbeat = ?, updated_at = ? WHERE id = ?",
+                "UPDATE runners SET runner_type = ?, status = ?, capacity = ?, storage_domain = ?, labels = ?, last_heartbeat = ?, updated_at = ? WHERE id = ?",
             )
             .bind(&runner.runner_type)
             .bind(&runner.status)
             .bind(runner.capacity)
+            .bind(&runner.storage_domain)
             .bind("[]")
             .bind(runner.last_heartbeat.map(|date| date.to_rfc3339()))
             .bind(Utc::now().to_rfc3339())
@@ -2624,6 +2755,7 @@ impl RunnerQueries {
             existing.runner_type = runner.runner_type.clone();
             existing.status = runner.status.clone();
             existing.capacity = runner.capacity;
+            existing.storage_domain = runner.storage_domain.clone();
             existing.last_heartbeat = runner.last_heartbeat;
             return Ok((existing, RunnerRegistration::Refreshed));
         }
@@ -2659,6 +2791,165 @@ impl RunnerQueries {
         })
         .await?;
         Ok(())
+    }
+
+    /// Persist runner pause and return unstarted assignments to the queue
+    /// atomically. Running work remains owned by the runner.
+    pub async fn set_paused(pool: &Pool, id: RunnerId, paused: bool) -> Result<Option<(u64, i64)>> {
+        let mut transaction = begin_immediate(pool.pool(), "runner pause").await?;
+        let current = sqlx::query("SELECT paused, pause_generation FROM runners WHERE id = ?")
+            .bind(id.to_string())
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|error| {
+                Error::database(format!("failed to load runner pause state: {error}"))
+            })?;
+        let Some(current) = current else {
+            transaction.rollback().await.ok();
+            return Ok(None);
+        };
+        let was_paused: bool = current
+            .try_get("paused")
+            .map_err(|error| Error::database(format!("invalid runner paused state: {error}")))?;
+        let generation: i64 = current.try_get("pause_generation").map_err(|error| {
+            Error::database(format!("invalid runner pause generation: {error}"))
+        })?;
+
+        if paused && !was_paused {
+            sqlx::query(
+                "UPDATE runners SET paused = 1, pause_generation = ?, updated_at = ? WHERE id = ?",
+            )
+            .bind(generation.saturating_add(1))
+            .bind(Utc::now().to_rfc3339())
+            .bind(id.to_string())
+            .execute(&mut *transaction)
+            .await
+            .map_err(|error| Error::database(format!("failed to update runner pause: {error}")))?;
+        } else {
+            sqlx::query("UPDATE runners SET paused = ?, updated_at = ? WHERE id = ?")
+                .bind(paused)
+                .bind(Utc::now().to_rfc3339())
+                .bind(id.to_string())
+                .execute(&mut *transaction)
+                .await
+                .map_err(|error| {
+                    Error::database(format!("failed to update runner pause: {error}"))
+                })?;
+        }
+        if !paused {
+            sqlx::query("DELETE FROM runner_drain_receipts WHERE runner_id = ?")
+                .bind(id.to_string())
+                .execute(&mut *transaction)
+                .await
+                .map_err(|error| {
+                    Error::database(format!("failed to clear runner drain receipt: {error}"))
+                })?;
+        }
+
+        let requeued = if paused {
+            sqlx::query("UPDATE jobs SET status = 'queued', runner_id = NULL, started_at = NULL, lease_token = NULL, deferred_reason = 'runner_paused' WHERE runner_id = ? AND status = 'assigned'")
+                .bind(id.to_string())
+                .execute(&mut *transaction)
+                .await
+                .map_err(|error| Error::database(format!("failed to requeue unstarted runner jobs: {error}")))?
+                .rows_affected()
+        } else {
+            0
+        };
+
+        let running = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM jobs WHERE runner_id = ? AND status = 'running'",
+        )
+        .bind(id.to_string())
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(|error| {
+            Error::database(format!("failed to count running runner jobs: {error}"))
+        })?;
+
+        transaction
+            .commit()
+            .await
+            .map_err(|error| Error::database(format!("failed to commit runner pause: {error}")))?;
+        Ok(Some((requeued, running)))
+    }
+
+    /// Persist a runner's drain snapshot only for the currently paused generation.
+    pub async fn record_drain_receipt(
+        pool: &Pool,
+        runner_id: RunnerId,
+        generation: i64,
+        active_job_ids: &[String],
+        owned_container_ids: &[String],
+    ) -> Result<bool> {
+        if generation < 1
+            || active_job_ids.len() > 1024
+            || owned_container_ids.len() > 1024
+            || active_job_ids
+                .iter()
+                .any(|id| id.is_empty() || id.len() > 128)
+            || owned_container_ids
+                .iter()
+                .any(|id| id.is_empty() || id.len() > 256)
+        {
+            return Ok(false);
+        }
+        let active_jobs = serde_json::to_string(active_job_ids).map_err(|error| {
+            Error::database(format!("failed to encode active job ids: {error}"))
+        })?;
+        let containers = serde_json::to_string(owned_container_ids)
+            .map_err(|error| Error::database(format!("failed to encode container ids: {error}")))?;
+        let acknowledged_at = Utc::now().to_rfc3339();
+        let result = sqlx::query(
+            "INSERT INTO runner_drain_receipts (runner_id, generation, active_job_ids, owned_container_ids, acknowledged_at) SELECT ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM runners WHERE id = ? AND paused = 1 AND pause_generation = ?) ON CONFLICT(runner_id) DO UPDATE SET generation = excluded.generation, active_job_ids = excluded.active_job_ids, owned_container_ids = excluded.owned_container_ids, acknowledged_at = excluded.acknowledged_at",
+        )
+        .bind(runner_id.to_string())
+        .bind(generation)
+        .bind(active_jobs)
+        .bind(containers)
+        .bind(acknowledged_at)
+        .bind(runner_id.to_string())
+        .bind(generation)
+        .execute(pool.pool())
+        .await
+        .map_err(|error| Error::database(format!("failed to persist runner drain receipt: {error}")))?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// Read the latest runner drain receipt, if one was recorded.
+    pub async fn drain_receipt(
+        pool: &Pool,
+        runner_id: RunnerId,
+    ) -> Result<Option<RunnerDrainReceipt>> {
+        let row = sqlx::query("SELECT generation, active_job_ids, owned_container_ids, acknowledged_at FROM runner_drain_receipts WHERE runner_id = ?")
+            .bind(runner_id.to_string())
+            .fetch_optional(pool.pool())
+            .await
+            .map_err(|error| Error::database(format!("failed to read runner drain receipt: {error}")))?;
+        row.map(|row| {
+            let active_job_ids: String = row
+                .try_get("active_job_ids")
+                .map_err(|error| Error::database(format!("invalid drain active jobs: {error}")))?;
+            let owned_container_ids: String = row
+                .try_get("owned_container_ids")
+                .map_err(|error| Error::database(format!("invalid drain containers: {error}")))?;
+            Ok(RunnerDrainReceipt {
+                runner_id,
+                generation: row.try_get("generation").map_err(|error| {
+                    Error::database(format!("invalid drain generation: {error}"))
+                })?,
+                active_job_ids: serde_json::from_str(&active_job_ids).map_err(|error| {
+                    Error::database(format!("invalid drain active jobs JSON: {error}"))
+                })?,
+                owned_container_ids: serde_json::from_str(&owned_container_ids).map_err(
+                    |error| Error::database(format!("invalid drain containers JSON: {error}")),
+                )?,
+                acknowledged_at: row.try_get("acknowledged_at").map_err(|error| {
+                    Error::database(format!("invalid drain receipt timestamp: {error}"))
+                })?,
+            })
+        })
+        .transpose()
     }
 
     /// Update runner status
@@ -2767,11 +3058,12 @@ impl RunnerQueries {
 
     /// List online runners
     pub async fn list_online(pool: &Pool) -> Result<Vec<crate::models::Runner>> {
-        let rows =
-            sqlx::query("SELECT * FROM runners WHERE status = 'online' ORDER BY created_at DESC")
-                .fetch_all(pool.pool())
-                .await
-                .map_err(|e| Error::database(format!("failed to list online runners: {e}")))?;
+        let rows = sqlx::query(
+            "SELECT * FROM runners WHERE status = 'online' AND paused = 0 ORDER BY created_at DESC",
+        )
+        .fetch_all(pool.pool())
+        .await
+        .map_err(|e| Error::database(format!("failed to list online runners: {e}")))?;
 
         let runners = rows
             .into_iter()
@@ -3472,8 +3764,7 @@ impl TriggerRequestQueries {
                 .bind(
                     request
                         .pipeline_id
-                        .map(|id| id.to_string())
-                        .unwrap_or_default(),
+                        .map_or_default(|id| id.to_string()),
                 )
                 .fetch_optional(&mut *transaction)
                 .await
@@ -3547,7 +3838,7 @@ impl TriggerRequestQueries {
         )
         .bind(repo_id.to_string())
         .bind(new_hash)
-        .bind(pipeline_id.map(|id| id.to_string()).unwrap_or_default())
+        .bind(pipeline_id.map_or_default(|id| id.to_string()))
         .fetch_optional(pool.pool())
         .await
         .map_err(|e| Error::database(format!("failed to find active trigger request: {e}")))?;
@@ -4035,6 +4326,95 @@ mod tests {
         );
         run.id = run_id;
         PipelineRunQueries::create(pool, &run).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn defer_assigned_job_requires_matching_unstarted_lease() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+        let run_id = PipelineRunId::new();
+        seed_run(&pool, run_id).await;
+        let job = crate::models::Job::new(run_id, "defer-contract".to_string());
+        JobQueries::create(&pool, &job).await.unwrap();
+        JobQueries::update_status(&pool, job.id, "queued")
+            .await
+            .unwrap();
+        let runner = crate::models::Runner::new(
+            "defer-contract-runner".to_string(),
+            crate::models::RunnerType::Docker,
+            1,
+        );
+        RunnerQueries::create(&pool, &runner).await.unwrap();
+
+        assert!(
+            JobQueries::assign_with_lease(&pool, job.id, runner.id, "lease-a")
+                .await
+                .unwrap()
+        );
+        assert!(!JobQueries::defer_assigned_with_lease(
+            &pool,
+            job.id,
+            runner.id,
+            "stale-lease",
+            "host_storage_lease_busy",
+        )
+        .await
+        .unwrap());
+        assert!(JobQueries::defer_assigned_with_lease(
+            &pool,
+            job.id,
+            runner.id,
+            "lease-a",
+            "host_storage_lease_busy",
+        )
+        .await
+        .unwrap());
+
+        let deferred = JobQueries::get(&pool, job.id).await.unwrap().unwrap();
+        assert_eq!(deferred.status, "queued");
+        assert!(deferred.runner_id.is_none());
+        assert!(deferred.lease_token.is_none());
+        assert_eq!(
+            deferred.deferred_reason.as_deref(),
+            Some("host_storage_lease_busy")
+        );
+        assert!(!JobQueries::defer_assigned_with_lease(
+            &pool,
+            job.id,
+            runner.id,
+            "lease-a",
+            "host_storage_lease_busy",
+        )
+        .await
+        .unwrap());
+
+        assert!(
+            JobQueries::assign_with_lease(&pool, job.id, runner.id, "lease-b")
+                .await
+                .unwrap()
+        );
+        assert!(
+            JobQueries::start_with_lease(&pool, job.id, runner.id, "lease-b")
+                .await
+                .unwrap()
+        );
+        assert!(!JobQueries::defer_assigned_with_lease(
+            &pool,
+            job.id,
+            runner.id,
+            "lease-b",
+            "host_storage_lease_busy",
+        )
+        .await
+        .unwrap());
+        assert_eq!(
+            JobQueries::get(&pool, job.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "running"
+        );
     }
 
     #[tokio::test]
@@ -4993,6 +5373,264 @@ mod tests {
         );
     }
 
+    // The push base and the ref name must survive the durable write. The
+    // `jobs` table has no env column, so the run row is the only durable
+    // carrier of the base: without it a restarted control plane cannot
+    // re-publish the base to the run's jobs.
+    #[tokio::test]
+    async fn test_activate_pipeline_and_create_run_persists_ref_name_and_push_base() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+
+        let owner = crate::models::User::new(
+            "push-base-owner".to_string(),
+            "push-base-owner@example.com".to_string(),
+            "hash".to_string(),
+        );
+        crate::queries::UserQueries::create(&pool, &owner)
+            .await
+            .unwrap();
+        let repo = crate::models::Repository::new(
+            "push-base-repo".to_string(),
+            owner.id,
+            "/git/push-base-repo".to_string(),
+        );
+        RepoQueries::create(&pool, &repo).await.unwrap();
+
+        let pipeline = crate::models::Pipeline {
+            id: PipelineId::new(),
+            repo_id: repo.id,
+            name: "ci".to_string(),
+            trigger_type: "push".to_string(),
+            config: serde_json::json!({}),
+            created_at: chrono::Utc::now(),
+            active: true,
+        };
+        let mut run = crate::models::PipelineRun::new(
+            pipeline.id,
+            repo.id,
+            "push".to_string(),
+            "b".repeat(40),
+        );
+        run.ref_name = Some("refs/heads/main".to_string());
+        let base = "a".repeat(40);
+        run.push_base_sha = Some(base.clone());
+
+        PipelineQueries::activate_pipeline_and_create_run(&pool, &pipeline, &run)
+            .await
+            .unwrap();
+
+        let stored = PipelineRunQueries::get(&pool, run.id)
+            .await
+            .unwrap()
+            .expect("run row");
+        assert_eq!(stored.ref_name.as_deref(), Some("refs/heads/main"));
+        assert_eq!(stored.push_base_sha.as_deref(), Some(base.as_str()));
+    }
+
+    // Regression: the push path writes its run through
+    // `activate_pipeline_and_create_run`, and that INSERT used to drop
+    // `ref_name`. The supersede filter is `AND ref_name = ?`, so a NULL
+    // ref_name made the documented "newest-SHA-wins" pass a no-op for every
+    // push run: an older queued run on the same branch was never cancelled.
+    //
+    // The shape here is the production one: every push mints a fresh
+    // pipeline version row, so the two runs carry different `pipeline_id`s
+    // even though they are the same pipeline. Matching on the version row
+    // id could never reach the previous push's run.
+    #[tokio::test]
+    async fn test_supersede_stale_runs_cancels_an_older_run_created_by_the_push_path() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+
+        let owner = crate::models::User::new(
+            "supersede-push-owner".to_string(),
+            "supersede-push-owner@example.com".to_string(),
+            "hash".to_string(),
+        );
+        crate::queries::UserQueries::create(&pool, &owner)
+            .await
+            .unwrap();
+        let repo = crate::models::Repository::new(
+            "supersede-push-repo".to_string(),
+            owner.id,
+            "/git/supersede-push-repo".to_string(),
+        );
+        RepoQueries::create(&pool, &repo).await.unwrap();
+
+        let pipeline = crate::models::Pipeline {
+            id: PipelineId::new(),
+            repo_id: repo.id,
+            name: "ci".to_string(),
+            trigger_type: "push".to_string(),
+            config: serde_json::json!({}),
+            created_at: chrono::Utc::now(),
+            active: true,
+        };
+
+        // The older run is created exactly the way a push creates it: its
+        // own pipeline version row, carrying the pre-push base.
+        let mut older = crate::models::PipelineRun::new(
+            pipeline.id,
+            repo.id,
+            "push".to_string(),
+            "a".repeat(40),
+        );
+        older.created_at = Utc::now() - chrono::Duration::hours(1);
+        older.ref_name = Some("refs/heads/main".to_string());
+        older.push_base_sha = Some("c".repeat(40));
+        PipelineQueries::activate_pipeline_and_create_run(&pool, &pipeline, &older)
+            .await
+            .unwrap();
+
+        // The newer push mints its own pipeline version row for the same
+        // (repo, name) — the version-row id differs, the pipeline does not.
+        let newer_pipeline = crate::models::Pipeline {
+            id: PipelineId::new(),
+            repo_id: repo.id,
+            name: "ci".to_string(),
+            trigger_type: "push".to_string(),
+            config: serde_json::json!({}),
+            created_at: chrono::Utc::now(),
+            active: true,
+        };
+        let mut newer = crate::models::PipelineRun::new(
+            newer_pipeline.id,
+            repo.id,
+            "push".to_string(),
+            "b".repeat(40),
+        );
+        newer.created_at = Utc::now();
+        newer.ref_name = Some("refs/heads/main".to_string());
+        PipelineQueries::activate_pipeline_and_create_run(&pool, &newer_pipeline, &newer)
+            .await
+            .unwrap();
+        assert_ne!(
+            newer_pipeline.id, pipeline.id,
+            "consecutive pushes must carry different pipeline version row ids"
+        );
+
+        let superseded = PipelineQueries::supersede_stale_runs(
+            &pool,
+            repo.id,
+            "refs/heads/main",
+            newer_pipeline.id,
+            newer.id,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            superseded, 1,
+            "an older queued push run on the same ref must be superseded"
+        );
+
+        let older_row = PipelineRunQueries::get(&pool, older.id)
+            .await
+            .unwrap()
+            .expect("older run row");
+        assert_eq!(older_row.status, "cancelled");
+        assert_eq!(
+            older_row.error.as_deref(),
+            Some("superseded by a newer push")
+        );
+        assert_eq!(older_row.ref_name.as_deref(), Some("refs/heads/main"));
+    }
+
+    // A repo can hold a manual-triggered pipeline and a push-triggered
+    // pipeline under the same name (they alternate which version is
+    // active). A push must not cancel the manual pipeline's queued runs:
+    // the supersede scope is the pipeline's identity — its name AND
+    // trigger type — not the name alone.
+    #[tokio::test]
+    async fn test_supersede_stale_runs_leaves_a_same_named_manual_pipeline_alone() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+
+        let owner = crate::models::User::new(
+            "supersede-manual-owner".to_string(),
+            "supersede-manual-owner@example.com".to_string(),
+            "hash".to_string(),
+        );
+        crate::queries::UserQueries::create(&pool, &owner)
+            .await
+            .unwrap();
+        let repo = crate::models::Repository::new(
+            "supersede-manual-repo".to_string(),
+            owner.id,
+            "/git/supersede-manual-repo".to_string(),
+        );
+        RepoQueries::create(&pool, &repo).await.unwrap();
+
+        let manual_pipeline = crate::models::Pipeline {
+            id: PipelineId::new(),
+            repo_id: repo.id,
+            name: "ci".to_string(),
+            trigger_type: "manual".to_string(),
+            config: serde_json::json!({}),
+            created_at: chrono::Utc::now(),
+            active: true,
+        };
+        PipelineQueries::create(&pool, &manual_pipeline)
+            .await
+            .unwrap();
+
+        let mut manual = crate::models::PipelineRun::new(
+            manual_pipeline.id,
+            repo.id,
+            "webhook".to_string(),
+            "a".repeat(40),
+        );
+        manual.created_at = Utc::now() - chrono::Duration::hours(1);
+        manual.ref_name = Some("refs/heads/main".to_string());
+        PipelineRunQueries::create(&pool, &manual).await.unwrap();
+
+        // The push activates its own version row for the same (repo, name)
+        // and retires the manual one — exactly what the push path does.
+        let push_pipeline = crate::models::Pipeline {
+            id: PipelineId::new(),
+            repo_id: repo.id,
+            name: "ci".to_string(),
+            trigger_type: "push".to_string(),
+            config: serde_json::json!({}),
+            created_at: chrono::Utc::now(),
+            active: true,
+        };
+        let mut pushed = crate::models::PipelineRun::new(
+            push_pipeline.id,
+            repo.id,
+            "push".to_string(),
+            "b".repeat(40),
+        );
+        pushed.created_at = Utc::now();
+        pushed.ref_name = Some("refs/heads/main".to_string());
+        PipelineQueries::activate_pipeline_and_create_run(&pool, &push_pipeline, &pushed)
+            .await
+            .unwrap();
+
+        let superseded = PipelineQueries::supersede_stale_runs(
+            &pool,
+            repo.id,
+            "refs/heads/main",
+            push_pipeline.id,
+            pushed.id,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            superseded, 0,
+            "a push must not cancel a manual pipeline's run"
+        );
+
+        let manual_row = PipelineRunQueries::get(&pool, manual.id)
+            .await
+            .unwrap()
+            .expect("manual run row");
+        assert_eq!(
+            manual_row.status, "pending",
+            "the manual pipeline's run is untouched"
+        );
+    }
+
     #[tokio::test]
     async fn test_trigger_request_requeue_stale_and_terminal_failure() {
         let pool = Pool::memory().await.unwrap();
@@ -5476,11 +6114,12 @@ mod tests {
         let pool = Pool::memory().await.unwrap();
         pool.migrate().await.unwrap();
 
-        let first = crate::models::Runner::new(
+        let mut first = crate::models::Runner::new(
             "stable-runner".to_string(),
             crate::models::RunnerType::Docker,
             2,
         );
+        first.storage_domain = "shared-nas".to_string();
         let (registered, outcome) = RunnerQueries::register_or_refresh(&pool, &first)
             .await
             .unwrap();
@@ -5491,6 +6130,7 @@ mod tests {
             crate::models::RunnerType::Docker,
             4,
         );
+        restarted.storage_domain = "fedora-local-nvme".to_string();
         restarted.set_busy();
         let (refreshed, outcome) = RunnerQueries::register_or_refresh(&pool, &restarted)
             .await
@@ -5500,7 +6140,136 @@ mod tests {
         assert_eq!(refreshed.id, registered.id);
         assert_eq!(refreshed.capacity, 4);
         assert_eq!(refreshed.status, "busy");
+        assert_eq!(refreshed.storage_domain, "fedora-local-nvme");
         assert_eq!(RunnerQueries::list(&pool).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn runner_pause_requeues_unstarted_work_and_fences_assignment_and_start() {
+        let pool = Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+        let run_id = PipelineRunId::new();
+        seed_run(&pool, run_id).await;
+        let runner = crate::models::Runner::new(
+            "pause-contract-runner".to_string(),
+            crate::models::RunnerType::Docker,
+            2,
+        );
+        RunnerQueries::create(&pool, &runner).await.unwrap();
+
+        let running = crate::models::Job::new(run_id, "already-running".to_string());
+        JobQueries::create(&pool, &running).await.unwrap();
+        JobQueries::update_status(&pool, running.id, "queued")
+            .await
+            .unwrap();
+        assert!(
+            JobQueries::assign_with_lease(&pool, running.id, runner.id, "running-lease")
+                .await
+                .unwrap()
+        );
+        assert!(
+            JobQueries::start_with_lease(&pool, running.id, runner.id, "running-lease")
+                .await
+                .unwrap()
+        );
+
+        let assigned = crate::models::Job::new(run_id, "not-started".to_string());
+        JobQueries::create(&pool, &assigned).await.unwrap();
+        JobQueries::update_status(&pool, assigned.id, "queued")
+            .await
+            .unwrap();
+        assert!(
+            JobQueries::assign_with_lease(&pool, assigned.id, runner.id, "assigned-lease")
+                .await
+                .unwrap()
+        );
+
+        assert_eq!(
+            RunnerQueries::set_paused(&pool, runner.id, true)
+                .await
+                .unwrap(),
+            Some((1, 1))
+        );
+        let persisted_runner = RunnerQueries::get(&pool, runner.id).await.unwrap().unwrap();
+        assert!(persisted_runner.paused);
+        assert_eq!(persisted_runner.pause_generation, 1);
+        assert!(RunnerQueries::list_online(&pool).await.unwrap().is_empty());
+
+        assert!(RunnerQueries::record_drain_receipt(
+            &pool,
+            runner.id,
+            1,
+            &[],
+            &["container-still-running".to_string()],
+        )
+        .await
+        .unwrap());
+        let receipt = RunnerQueries::drain_receipt(&pool, runner.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(receipt.generation, 1);
+        assert_eq!(receipt.active_job_ids, Vec::<String>::new());
+        assert_eq!(receipt.owned_container_ids, ["container-still-running"]);
+        assert!(
+            !RunnerQueries::record_drain_receipt(&pool, runner.id, 2, &[], &[],)
+                .await
+                .unwrap()
+        );
+
+        let requeued = JobQueries::get(&pool, assigned.id).await.unwrap().unwrap();
+        assert_eq!(requeued.status, "queued");
+        assert_eq!(requeued.runner_id, None);
+        assert_eq!(requeued.deferred_reason.as_deref(), Some("runner_paused"));
+        let still_running = JobQueries::get(&pool, running.id).await.unwrap().unwrap();
+        assert_eq!(still_running.status, "running");
+        assert!(
+            !JobQueries::start_with_lease(&pool, assigned.id, runner.id, "assigned-lease")
+                .await
+                .unwrap()
+        );
+
+        let mut restarted = crate::models::Runner::new(
+            "pause-contract-runner".to_string(),
+            crate::models::RunnerType::Docker,
+            2,
+        );
+        restarted.status = "online".to_string();
+        let (refreshed, _) = RunnerQueries::register_or_refresh(&pool, &restarted)
+            .await
+            .unwrap();
+        assert!(
+            refreshed.paused,
+            "registration must not clear operator pause"
+        );
+
+        assert_eq!(
+            RunnerQueries::set_paused(&pool, runner.id, false)
+                .await
+                .unwrap(),
+            Some((0, 1))
+        );
+        let resumed = RunnerQueries::get(&pool, runner.id).await.unwrap().unwrap();
+        assert!(!resumed.paused);
+        assert_eq!(resumed.pause_generation, 1);
+        assert!(RunnerQueries::drain_receipt(&pool, runner.id)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            RunnerQueries::set_paused(&pool, runner.id, true)
+                .await
+                .unwrap(),
+            Some((0, 1))
+        );
+        assert_eq!(
+            RunnerQueries::get(&pool, runner.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .pause_generation,
+            2
+        );
     }
 
     /// Concurrent registrations of one name must converge on a single row.
@@ -6202,11 +6971,24 @@ mod tests {
         let mut unknown_receipt = crate::models::Job::new(run.id, "receipt-unknown".to_string());
         let mut garbage_receipt = crate::models::Job::new(run.id, "receipt-garbage".to_string());
         let mut live_queued = crate::models::Job::new(run.id, "still-queued".to_string());
+        // GF-01: the scheduler's runner-completion receipt carries
+        // `success`, not `status`. Grading only `status` read this row's
+        // `success: true` as no verdict at all and failed it closed, so a
+        // green job was recorded as failed.
+        let mut runner_completion =
+            crate::models::Job::new(run.id, "receipt-runner-completion".to_string());
+        // A backend failure keeps its class through the receipt: the
+        // runner records `outcome`, and the row must not come back as a
+        // plain code failure.
+        let mut runner_infrastructure =
+            crate::models::Job::new(run.id, "receipt-runner-infrastructure".to_string());
         for job in [
             &mut succeeded_receipt,
             &mut unknown_receipt,
             &mut garbage_receipt,
             &mut live_queued,
+            &mut runner_completion,
+            &mut runner_infrastructure,
         ] {
             JobQueries::create(&pool, job).await.unwrap();
         }
@@ -6244,8 +7026,18 @@ mod tests {
         tear(unknown_receipt.id, r#"{"status":"exploded"}"#).await;
         tear(garbage_receipt.id, "runner died mid-write").await;
         tear(assigned_receipt.id, r#"{"status":"failed"}"#).await;
+        tear(
+            runner_completion.id,
+            r#"{"job_id":"x","success":true,"exit_code":0,"step_results":[],"artifacts":[]}"#,
+        )
+        .await;
+        tear(
+            runner_infrastructure.id,
+            r#"{"job_id":"y","success":false,"outcome":"infrastructure_failure","exit_code":-1}"#,
+        )
+        .await;
 
-        assert_eq!(JobQueries::reconcile_evidence_rows(&pool).await.unwrap(), 4);
+        assert_eq!(JobQueries::reconcile_evidence_rows(&pool).await.unwrap(), 6);
 
         let graded = |job_id: gitforge_common::JobId| {
             let pool = &pool;
@@ -6256,6 +7048,14 @@ mod tests {
         assert_eq!(graded(unknown_receipt.id).await.status, "failed");
         assert_eq!(graded(garbage_receipt.id).await.status, "failed");
         assert_eq!(graded(assigned_receipt.id).await.status, "failed");
+        // A runner-completion receipt grades from its `success` boolean.
+        assert_eq!(graded(runner_completion.id).await.status, "succeeded");
+        // A backend failure keeps `infrastructure_failure`, not `failed`:
+        // the two mean different things to an operator (R6.3).
+        assert_eq!(
+            graded(runner_infrastructure.id).await.status,
+            "infrastructure_failure"
+        );
 
         // The repair grades from evidence without rewriting it: the receipt
         // columns keep their values and no start time is invented.

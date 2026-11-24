@@ -18,6 +18,7 @@ pub use client::GitForgeClient;
 pub use config::Config;
 
 const AUTH_LOGIN_USAGE: &str = "gitforge auth --login <username>";
+const ACCESS_TOKEN_RENEWAL_LEAD_SECS: i64 = 10 * 60;
 
 /// Scope selected for the local quality gate. A missing graph or an
 /// unrecognized/empty change set always selects the full workspace so the
@@ -361,7 +362,8 @@ async fn renew_session(server: &str, config: &mut Config) -> Result<()> {
         .and_then(|stamp| DateTime::parse_from_rfc3339(stamp).ok())
     {
         Some(expires_at) => {
-            expires_at.with_timezone(&Utc) < Utc::now() + chrono::Duration::minutes(10)
+            expires_at.with_timezone(&Utc)
+                < Utc::now() + chrono::Duration::seconds(ACCESS_TOKEN_RENEWAL_LEAD_SECS)
         }
         // No recorded expiry means the stored JWT's lifetime is unknown;
         // attempting one renewal is cheaper than a doomed request.
@@ -452,11 +454,23 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                 match api_client.login(username, &password).await {
                     Ok(response) => {
                         println!("✅ Login successful!");
-                        println!("   Token expires in {} seconds", response.expires_in);
+                        println!(
+                            "   Access token expires in {} seconds ({} hours)",
+                            response.expires_in,
+                            response.expires_in / 3_600
+                        );
                         if let Some(refresh_expires_in) = response.refresh_expires_in {
                             println!(
-                                "   Session renewable for {} days",
+                                "   Automatic renewal: enabled; the CLI refreshes when a command runs with {} minutes left",
+                                ACCESS_TOKEN_RENEWAL_LEAD_SECS / 60
+                            );
+                            println!(
+                                "   Each successful renewal rotates credentials and extends the session by {} days",
                                 refresh_expires_in / 86_400
+                            );
+                        } else {
+                            println!(
+                                "   Automatic renewal: unavailable; log in again when this token expires"
                             );
                         }
                         println!();
@@ -516,6 +530,11 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                             match (config.token_expires_at.as_deref(), &config.refresh_token) {
                                 (Some(expires_at), Some(_)) => {
                                     println!("   JWT expires: {expires_at}");
+                                    println!(
+                                        "   Automatic renewal: enabled ({}-minute window before CLI commands)",
+                                        ACCESS_TOKEN_RENEWAL_LEAD_SECS / 60
+                                    );
+                                    println!("   Successful renewals extend the session window.");
                                     if let Some(stamp) = &config.refresh_expires_at {
                                         println!("   Refresh credential expires: {stamp}");
                                     }
@@ -1110,8 +1129,7 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
             let affected = match &scope {
                 CheckScope::Workspace => graph
                     .as_ref()
-                    .map(gitforge_graph::DependencyGraph::crates)
-                    .unwrap_or_default(),
+                    .map_or_default(gitforge_graph::DependencyGraph::crates),
                 CheckScope::Packages(packages) => packages.clone(),
             };
 

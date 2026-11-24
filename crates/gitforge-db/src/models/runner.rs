@@ -54,6 +54,16 @@ pub struct Runner {
     pub status: String,
     pub last_heartbeat: Option<DateTime<Utc>>,
     pub capacity: i32,
+    /// Shared scheduling identity for the storage backing this runner.
+    /// Runners sharing a physical or network storage domain use the same key.
+    #[serde(default = "default_storage_domain")]
+    pub storage_domain: String,
+    /// Durable operator pause, independent of heartbeat and availability.
+    #[serde(default)]
+    pub paused: bool,
+    /// Monotonic generation for the current pause/drain handshake.
+    #[serde(default)]
+    pub pause_generation: i64,
     pub created_at: DateTime<Utc>,
 }
 
@@ -67,6 +77,9 @@ impl Runner {
             status: RunnerStatus::Online.as_str().to_string(),
             last_heartbeat: Some(Utc::now()),
             capacity,
+            storage_domain: default_storage_domain(),
+            paused: false,
+            pause_generation: 0,
             created_at: Utc::now(),
         }
     }
@@ -115,6 +128,10 @@ impl Runner {
             RunnerStatus::Online.as_str().to_string()
         }
     }
+}
+
+fn default_storage_domain() -> String {
+    "default".to_string()
 }
 
 #[cfg(test)]

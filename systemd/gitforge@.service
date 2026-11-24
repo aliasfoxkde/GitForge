@@ -14,6 +14,7 @@ Restart=always
 RestartSec=5
 StandardOutput=journal
 StandardError=journal
+IOAccounting=yes
 
 # Hardening
 NoNewPrivileges=true

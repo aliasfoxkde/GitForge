@@ -58,8 +58,11 @@ event causes `status` to become `attention` until it is completed or returned
 to pending.
 
 Before assembling a release bundle, run
-`scripts/gitforge-release-preflight <release-source-root>`. It fails closed
-unless `api`, `ci`, `git-server`, and `runner` are all present and executable.
+`scripts/gitforge-release-preflight <release-source-root> <source-commit>`. It
+fails closed unless `api`, `ci`, `git-server`, and `runner` are all present
+and executable, and unless each of them reports that it was built from
+`<source-commit>` — the release binaries live in gitignored paths, so their
+own stamp is the only evidence that they are not stale leftovers.
 The candidate CI binary owns the scheduler HTTP API, so the legacy standalone
 `gitforge-scheduler-service` must not be mixed into the bundle.
 

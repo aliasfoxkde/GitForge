@@ -89,7 +89,7 @@ async fn send(
         .uri(uri)
         .header("Authorization", format!("Bearer {token}"))
         .header("Content-Type", "application/json");
-    let payload = body.map(|v| v.to_string()).unwrap_or_default();
+    let payload = body.map_or_default(|v| v.to_string());
     let response = app
         .oneshot(builder.body(Body::from(payload)).unwrap())
         .await

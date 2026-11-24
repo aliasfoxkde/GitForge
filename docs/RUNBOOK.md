@@ -36,6 +36,13 @@ cargo build --release --workspace
 
 ## Running Services
 
+The NAS installation runs the GitForge control plane. The installer leaves
+`gitforge@runner.service` disabled and masked by default; CI execution belongs
+on the remote runner fleet. Only set `GITFORGE_ENABLE_LOCAL_RUNNER=1` for an
+intentional local-executor deployment after checking host capacity and the
+storage-admission policy. This opt-in must not be used to bypass a runner
+pause/drain or an active-job lease.
+
 ### 1. API Gateway
 
 The API gateway exposes the REST API for frontend integration.
@@ -66,6 +73,7 @@ JWT_SECRET=your-secret PORT=42780 ./target/release/api
 - `GET /api/pipeline-runs` - List pipeline runs (auth required)
 - `GET /api/jobs/:id` - Get job status (auth required)
 - `GET /api/runners` - List runners (auth required)
+- `POST /api/runners/{id}/pause` and `/resume` - Durable runner admission control (admin/maintainer)
 
 ### 2. Git Server
 
@@ -130,6 +138,20 @@ graded `failed` with the cause recorded on the run row (visible as
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `GITFORGE_WORKSPACE_PREP_TIMEOUT_SECS` | No | `300` | Per-command budget for workspace prep. Raise it on hosts that legitimately clone multi-gigabyte repositories; `0`/invalid values fall back to the default. |
+| `GITFORGE_IO_FULL_AVG10_LIMIT_PCT` | No | `25` | Scheduler and runner defer storage-heavy work when local `/proc/pressure/io` full `avg10` exceeds this percentage. Missing/malformed PSI fails closed. |
+| `GITFORGE_CPU_SOME_AVG10_LIMIT_PCT` | No | `80` | Runner defers storage-heavy work when local `/proc/pressure/cpu` some `avg10` exceeds this percentage. Missing/malformed PSI fails closed. |
+| `GITFORGE_STORAGE_DOMAIN` | No | Hostname | Stable identity for the backing storage used by this runner. Set the same value on runners that share a storage device or network filesystem; separate hosts with independent storage should use distinct values. |
+
+Storage-sensitive runner assignments acquire the host lease at
+`/run/lock/codex-host-storage.lock` before the runner claims them, then check
+local I/O/CPU PSI and active build processes. Missing PSI or an unreadable
+process probe defers the assignment. The backend-fixed manager uses the same
+host-local `flock` file while its heavy/normal child is alive. Provision it as
+`root:www-data` mode `0660` with the canonical backend-fixed
+`systemd/tmpfiles.d/codex-host-storage.conf`; the GitForge runner unit needs
+the `www-data` supplementary group and write access to that file. If pressure
+is high or the lease is busy, the runner returns the assignment to the queue
+poll. If the file is unavailable, it refuses to start the job.
 
 Failed runs carry their cause in the `error` field of
 `GET /api/v1/ci/pipeline-runs/{id}`, and a run that ends `failed` or
@@ -137,6 +159,16 @@ Failed runs carry their cause in the `error` field of
 `cancelled`, so no zombie rows outlive a terminal run.
 
 ### 4. Runner Agent
+
+#### Pausing a runner
+
+Use `gitforge runner --pause <runner-id>` to stop new assignments. The API
+requeues jobs that have not started and prevents durable assignment/start
+transitions while paused. Jobs already running are left in place. Check the
+reported `running_jobs` count and wait for the runner's own job/container
+inventory to reach zero before maintenance; the pause response alone is not
+proof that containers drained. Use `gitforge runner --resume <runner-id>` to
+restore scheduling after maintenance.
 
 The runner agent executes jobs in Docker containers.
 
@@ -168,7 +200,7 @@ GITFORGE_SCHEDULER_TOKEN=<token> \
 | `GITFORGE_RUNNER_REGISTRATION_TOKEN` | No | _(none)_ | Bearer token presented to the scheduler's runner-registration surface (`POST /runners` on the CI/scheduler port, and `POST /api/runners` on the gateway). Falls back to `GITFORGE_SCHEDULER_TOKEN` when unset. Registration is fail-closed: with no token configured on the scheduler, every registration is refused (503) |
 | `GITFORGE_REGISTER_ATTEMPTS` | No | `6` | Registration attempts before giving up when the scheduler is unreachable |
 | `GITFORGE_REGISTER_BACKOFF_SECS` | No | `1` | Initial registration retry delay; doubles per attempt up to 30s |
-| `GITFORGE_CACHE_ROOT` | No | `~/.cache/gitforge` | Host root for job cache mounts (compiled cargo artifacts). Used when a job declares a `cache:` block: the runner bind-mounts `<root>/cargo/<image>` at the job's `mount_path` inside the container. Falls back to `/var/cache/gitforge` when `$HOME` is unset. A cache that cannot be prepared is skipped with a warning — jobs still run cold. |
+| `GITFORGE_CACHE_ROOT` | No | `~/.cache/gitforge` | Host root for job cache mounts (compiled cargo artifacts). Used when a job declares a `cache:` block: the runner bind-mounts `<root>/cargo/<image>` at the job's `mount_path` inside the container. Falls back to `/var/cache/gitforge` when `$HOME` is unset. A mount that cannot be prepared fails the job: the runner reports it as an infrastructure failure, so the reason reaches the job's own result instead of a log line. |
 
 > **Startup behavior**: If `GITFORGE_SCHEDULER_URL` is missing or empty, the runner exits immediately
 > with a clear error message. Invalid values for numeric variables (non-integer) also cause a fast
@@ -196,30 +228,73 @@ pins. The full cycle is mechanical:
 #    the persisted definition, name for name).
 scripts/gitforge-release-gate <40-hex-source-commit>
 
-# 2. Bundle: preflight + build release binaries + MANIFEST.sha256 + READY.
+# 2. Build the release binaries from the checkout and install them into the
+#    source root. Every binary is stamped with the commit it was built from;
+#    one that does not report that commit is never installed.
+scripts/gitforge-release-build /nas/Temp/repos/GitForge
+
+# 3. Bundle: preflight + provenance check + MANIFEST.sha256 + READY.
 GITFORGE_SOURCE_COMMIT=<sha> \
   scripts/gitforge-release-bundle /nas/Temp/repos/GitForge \
   /nas/Temp/repos/GitForge/releases gitforge-<shortsha>-<YYYYMMDD>
 
-# 3. Promote + restart, drain-gated and rollback-ready:
+# 4. Promote + restart, drain-gated and rollback-ready:
 ./scripts/gitforge-release-auto            # dry-run: prints the plan
 ./scripts/gitforge-release-auto --apply    # or AUTO_UPDATE=1
 ```
 
 `gitforge-release-auto` refuses to run twice concurrently (flock on
-`releases/.auto-update.lock`), defers while any `gitforge-job-*` container is
-still running (drain gate — pending-only runs are just queued and do not
-block), flips `gitforge-current` atomically, restarts the `gitforge@*` units,
-and leaves the previous bundle in place for instant rollback (re-point the
-symlink and restart). Verify after cutover: `systemctl` unit states, `/health`
-on :42780/:42781/:42782, and `scripts/gitforge-status` with
+`releases/.auto-update.lock`), defers while the authoritative store reports a
+job in flight, flips `gitforge-current` atomically, restarts the `gitforge@*`
+units, and leaves the previous bundle in place for instant rollback
+(re-point the symlink and restart). Verify after cutover: `systemctl` unit
+states, `/health` on :42780/:42781/:42782, and `scripts/gitforge-status` with
 `GITFORGE_RELEASE_ROOT=/nas/Temp/repos/GitForge/releases/gitforge-current`
 (the default path reports false drift on this instance).
+
+The busy signal is read from the authoritative store by
+`scripts/gitforge-release-busy` — never from the runner's container names. A
+job counts as in flight when its row is `assigned` or `running` AND its proof
+of life is still inside the fence grace window
+(`GITFORGE_JOB_FENCE_GRACE_SECS`, default 300s — the scheduler's own
+default, read from the same knob). Queued and pending rows are queued work
+and do not block. Two properties follow from that definition:
+
+  - the gate cannot be wedged by a stale row. A `running` row whose runner
+    died is fenced by the scheduler itself once its proof of life ages past
+    the grace window; counting it as busy would defer every cutover until
+    someone intervened by hand.
+  - the container names cannot be the signal. The runner keeps a warm pool of
+    containers that have no job row at all, so counting them is permanently
+    non-zero (GF-16, 2026-11-06): every cutover was deferred forever, and
+    the channel reported that as an ordinary "deferred", which reads like
+    normal operation.
+
+If the store cannot be read, the pass refuses the cutover (exit 1) rather
+than guessing. An unreadable store is a failure to surface, not a clean
+deferral — a silently unreadable store stalls the channel with no signal.
 
 Known boot behavior: the ci unit runs migrations, then the startup workspace
 sweep, then spawns the event consumer. Triggers published while the consumer
 is down or busy are durable and land once it drains — a `202` with a null
 `pipeline_run_id` means queued, not lost; re-query before re-triggering.
+
+Every release binary carries the commit it was built from, and the release
+chain proves it. The build stamps the commit into the binaries
+(`crates/gitforge-common/build.rs`, surfaced as `--version` on each service);
+`gitforge-release-build` refuses to install a binary that does not report the
+checkout's commit; `gitforge-release-preflight` and `gitforge-release-verify`
+refuse a bundle whose binaries disagree with the `source_commit` the bundle
+claims. The claim is therefore carried by the binaries themselves rather than
+by whoever assembled the bundle.
+
+This check exists because the release binaries live in gitignored paths at the
+root of the source root: a bundle assembled from stale leftovers passed every
+other gate — they were present, they were executable, and the checksum
+manifest was computed from whatever was copied — while stamping a commit they
+were never built from (GF-14, 2026-11-05). The build must therefore run in a
+git checkout; a build from a source copy sets `GITFORGE_BUILD_COMMIT` (and
+`GITFORGE_BUILD_DIRTY`) explicitly, and the same check applies.
 
 Bundle cuts are atomic as of 2026-10-10: `gitforge-release-bundle` assembles
 under `releases/.incomplete-<release-id>/` and renames into place only once
@@ -246,7 +321,10 @@ scripts/gitforge-remote-cutover --units user \
 ```
 
 The script polls the job table until nothing is `assigned`/`running` (a
-pending-only backlog does not block), stops the scheduler units first
+pending-only backlog does not block), using the same reader as the NAS
+promote — so a row left behind by a dead runner does not hold the drain
+either, and the sqlite3 CLI is no longer required on the target host
+(the python3 sqlite3 fallback serves it), stops the scheduler units first
 (`ci`, then `runner`, then `api`/`git-server`), flips the symlink with
 `mv -T`, restarts stateless before schedulers, and prints the boot-adoption
 journal lines. Units that are not installed — or masked (retired) — on the
@@ -281,10 +359,36 @@ Fedora operational notes:
 - **NAS (control plane).** System-level template units
   `gitforge@{api,ci,git-server}.service` + the repo-of-record, the API
   gateway (:42780), the scheduler (:42781), and git serving (:42782). The
-  NAS `gitforge@runner.service` unit is **masked — retired, not failed**:
-  local execution moved off the NAS, and `gitforge-release-auto` /
+  NAS `gitforge@runner.service` unit is masked to prevent future starts. A
+  systemd mask does not stop a process that was already running; verify the
+  unit's `MainPID`, runner-owned containers, and durable in-flight jobs before
+  calling local execution retired. `gitforge-release-auto` and
   `gitforge-status` skip masked units instead of failing the promote (the
   pre-fix behavior made every release roll back forever).
+
+  **Audit snapshot — 2026-11-18:** this host violated that retirement
+  assumption. `gitforge@runner.service` was masked but still active with PID
+  3652512, running the 2026-11-12 release binary since Nov 12. Its journal
+  shows it accepted jobs `31fbcd4d-1216-4f65-a6d4-a8f78ce6524e` and
+  `a18e9131-9bb1-4054-a457-04230ecc0b45` concurrently and created their Docker
+  containers on the NAS worktree. The runner also accepted the release job
+  `b18a5439-29a1-42bf-a1e6-799ea91229ee`, which was still active at the time
+  of inspection. Therefore this NAS runner was not retired at that time.
+  Drain it through the durable pause/control-plane path and verify zero active
+  jobs and owned containers before any operator stop or release action; do not
+  infer retirement from `UnitFileState=masked`.
+  The authoritative scheduler database is `/var/lib/gitforge/gitforge.db`,
+  selected by `/etc/gitforge/database.env` (the ignored `/nas/.../data/gitforge.db`
+  file is stale and must not be used for runtime conclusions). A read-only
+  query on 2026-11-18 found `swarmone-docker` online with a fresh heartbeat,
+  while `fedora-docker` was offline (last heartbeat 2026-11-12) and
+  `t5500-docker` was offline (last heartbeat 2026-10-11). Thus the local runner
+  was the only online executor in the authoritative store at that observation.
+  The live `runners` table also lacked the candidate `storage_domain` and
+  `paused` columns, confirming the November 17 scheduler schema changes had
+  not been applied to the production database. Restore and validate at least
+  one intended remote executor before draining the local runner; the running
+  local process is carrying CI work.
 - **Execution fleet.** Remote docker runners register into the NAS
   scheduler: `fedora-docker` on 192.168.1.202 and `t5500-docker`, so jobs
   dispatch off-host while pushes, runs, and logs stay on the NAS instance.

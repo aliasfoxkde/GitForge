@@ -21,6 +21,10 @@ jobs:
     # multi-crate workspace; keep the guard bounded but allow completion.
     timeout-minutes: 45
     env:
+      # The self-hosted runner uses a host-build-lease wrapper that blocks
+      # --workspace builds unless GITHUB_ACTIONS is true. Without this the
+      # Rust build step always exits 75 and CodeQL never produces results.
+      GITHUB_ACTIONS: "true"
       CARGO_BUILD_JOBS: 2
       CARGO_INCREMENTAL: 0
       # Match the dedicated runner's 12 GiB memory cap and avoid CodeQL's
@@ -59,7 +63,7 @@ jobs:
 
       - name: Install Rust
         if: matrix.language == 'rust'
-        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
           toolchain: stable
 

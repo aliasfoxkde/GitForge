@@ -26,6 +26,7 @@ use ssh_server::{run_ssh_server, SshServerConfig};
 #[allow(unused_imports)]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::time::Duration;
 use tokio::time::timeout;
 use tower_http::trace::TraceLayer;
@@ -39,8 +40,16 @@ struct AppState {
     ci_trigger_url: Option<String>,
     ci_trigger_token: Option<String>,
     http_client: reqwest::Client,
+    dead_letter_pool: Option<Arc<Pool>>,
+    shutdown_flag: Arc<AtomicBool>,
+    /// Max concurrent retry tasks to prevent unbounded task accumulation.
+    retry_limit: Arc<tokio::sync::Semaphore>,
 }
 
+/// Process-level semaphore capping concurrent retry tasks.
+/// Used by persist_ci_trigger when it spawns background retry loops.
+static RETRY_LIMIT: LazyLock<Arc<tokio::sync::Semaphore>> =
+    LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(100)));
 #[derive(Debug, serde::Deserialize)]
 struct InfoRefsQuery {
     service: Option<String>,
@@ -48,6 +57,16 @@ struct InfoRefsQuery {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // The release chain asks a binary for the commit it was built from
+    // (scripts/gitforge-release-stamps). Answer before any other work so
+    // that asking for provenance never starts a service, opens a database
+    // or binds a port.
+    if let Some(line) =
+        gitforge_common::build::version_line_if_requested("git-server", std::env::args().skip(1))
+    {
+        println!("{line}");
+        return Ok(());
+    }
     // Initialize logging
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -117,6 +136,13 @@ async fn main() -> anyhow::Result<()> {
     let saved_db_pool = db_pool.clone();
 
     // Create app state
+
+    // Shutdown flag for background loops
+    let shutdown_flag = Arc::new(AtomicBool::new(false));
+
+    // Cap concurrent retry tasks to prevent unbounded accumulation during
+    // sustained DB outages.
+    let retry_limit = Arc::new(tokio::sync::Semaphore::new(100));
     let state = AppState {
         http_handler,
         storage: storage.clone(),
@@ -124,6 +150,9 @@ async fn main() -> anyhow::Result<()> {
         ci_trigger_url: std::env::var("GITFORGE_CI_TRIGGER_URL").ok(),
         ci_trigger_token: std::env::var("GITFORGE_CI_TRIGGER_TOKEN").ok(),
         http_client: ci_http_client(),
+        dead_letter_pool: saved_db_pool.clone(),
+        shutdown_flag: shutdown_flag.clone(),
+        retry_limit: retry_limit.clone(),
     };
 
     if state.ci_trigger_url.is_none() || state.ci_trigger_token.is_none() {
@@ -135,7 +164,14 @@ async fn main() -> anyhow::Result<()> {
     if state.db_pool.is_some() && state.ci_trigger_url.is_some() && state.ci_trigger_token.is_some()
     {
         let delivery_state = state.clone();
+        // TODO: cap concurrent retry tasks per process (max 100)
         tokio::spawn(async move { ci_delivery_loop(delivery_state).await });
+        // Dead letter cleanup runs hourly; pool is None when DB is not configured.
+        if let Some(pool) = state.dead_letter_pool.clone() {
+            tokio::spawn(
+                async move { dead_letter_cleanup_loop(pool, shutdown_flag.clone()).await },
+            );
+        }
     }
 
     // Build router for Git HTTP protocol
@@ -704,6 +740,62 @@ const CI_TRIGGER_SYNC_WINDOW: std::time::Duration = std::time::Duration::from_se
 
 /// Ceiling of the exponential insert backoff.
 const CI_TRIGGER_MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(30);
+/// Maximum duration for the dead letter retry window.
+///
+/// `GITFORGE_CI_TRIGGER_DEAD_LETTER_AFTER` overrides the default of 48 hours.
+/// Zero means infinite (legacy behavior).
+fn read_dead_letter_max_duration_from_env() -> std::time::Duration {
+    std::env::var("GITFORGE_CI_TRIGGER_DEAD_LETTER_AFTER")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .map(std::time::Duration::from_secs)
+        .filter(|d| !d.is_zero())
+        .unwrap_or(std::time::Duration::from_secs(60 * 60 * 48))
+}
+
+/// Write a permanently-failed CI trigger to the dead letter table.
+///
+/// Returns `Ok(())` if the dead letter entry was persisted, `Err` if the
+/// table could not be written. A write failure is logged but never
+/// propagates because the trigger is already lost regardless.
+/// Cleanup task: remove dead letter entries older than 30 days.
+///
+/// Runs once per hour while the git-server process is alive. Errors are
+/// logged and retried on the next pass — the task never stops the server.
+async fn dead_letter_cleanup_loop(
+    pool: Arc<gitforge_db::Pool>,
+    shutdown: Arc<AtomicBool>,
+) {
+    const PURGE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600); // 1 hour
+    const PURGE_AGE: std::time::Duration = std::time::Duration::from_secs(30 * 86400); // 30 days
+
+    loop {
+        if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+            break;
+        }
+        tokio::time::sleep(PURGE_INTERVAL).await;
+        let cutoff = (chrono::Utc::now() - chrono::Duration::seconds(PURGE_AGE.as_secs() as i64))
+            .to_rfc3339();
+        let result = sqlx::query("DELETE FROM ci_trigger_dead_letter WHERE created_at < ?")
+            .bind(&cutoff)
+            .execute(pool.pool())
+            .await;
+        match result {
+            Ok(rows) => {
+                let count = rows.rows_affected();
+                if count > 0 {
+                    tracing::info!(
+                        removed_rows = count,
+                        "purged dead letter entries older than 30 days"
+                    );
+                }
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "dead letter cleanup failed; will retry next pass");
+            }
+        }
+    }
+}
 
 /// Insert one `ci.trigger.pending` outbox row, retrying until it lands.
 ///
@@ -748,12 +840,45 @@ async fn persist_ci_trigger(
                     "ci trigger insert failed; retrying"
                 );
                 if started.elapsed() + backoff > sync_window {
+                    // The inline retry budget is exhausted. Spawn a background
+                    // task that keeps retrying with a fixed backoff, but gives
+                    // up after GITFORGE_CI_TRIGGER_DEAD_LETTER_AFTER (default
+                    // 48 hours) and writes permanently-failed triggers to the
+                    // dead letter table so they are never silently lost.
+                    let max_duration = read_dead_letter_max_duration_from_env();
                     let pool = pool.clone();
                     let payload = payload.to_string();
+                    let event_id = uuid::Uuid::new_v4().to_string();
+                    // Cap concurrent retry tasks by acquiring a permit from the
+                    // semaphore. The permit guard is moved into the spawned task
+                    // so it is released when the task completes (success, failure,
+                    // or dead-letter expiry), allowing the next retry to proceed.
+                    let permit = RETRY_LIMIT.acquire().await.unwrap();
                     tokio::spawn(async move {
-                        let mut deferred_attempt = 0;
+                        let _permit = permit; // guard: drop releases permit
+                        let deadline = std::time::Instant::now() + max_duration;
+                        let mut attempt = 0usize;
                         loop {
-                            deferred_attempt += 1;
+                            if std::time::Instant::now() >= deadline {
+                                // Permanent failure: write to dead letter.
+                                let _ = sqlx::query(
+                                    "INSERT INTO ci_trigger_dead_letter (id, payload, retry_count, last_error, created_at) \
+                                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                                )
+                                .bind(uuid::Uuid::new_v4().to_string())
+                                .bind(&payload)
+                                .bind(attempt as i64)
+                                .bind("database permanently unavailable after retry deadline")
+                                .bind(chrono::Utc::now().to_rfc3339())
+                                .execute(pool.pool())
+                                .await;
+                                tracing::error!(
+                                    %event_id,
+                                    "ci trigger permanently failed after deadline; written to dead letter"
+                                );
+                                break;
+                            }
+                            attempt += 1;
                             tokio::time::sleep(max_backoff).await;
                             let result = sqlx::query("INSERT INTO events (id, event_type, payload, created_at, delivery_attempts) VALUES (?, ?, ?, ?, 0)")
                                 .bind(uuid::Uuid::new_v4().to_string())
@@ -765,13 +890,13 @@ async fn persist_ci_trigger(
                             match result {
                                 Ok(_) => {
                                     tracing::info!(
-                                        deferred_attempt,
+                                        deferred_attempt = attempt,
                                         "deferred ci trigger row landed after the database recovered"
                                     );
-                                    return;
+                                    break;
                                 }
                                 Err(error) => tracing::warn!(
-                                    deferred_attempt,
+                                    deferred_attempt = attempt,
                                     error = %error,
                                     "deferred ci trigger insert still failing"
                                 ),
@@ -905,7 +1030,26 @@ async fn ci_delivery_loop(state: AppState) {
         if let Err(error) = deliver_pending_ci_events(&state).await {
             tracing::warn!(error = %error, "CI outbox delivery deferred");
         }
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        // Check shutdown flag every tick. Uses a short sleep so shutdown
+        // latency stays bounded even when deliveries succeed.
+        let sleep = std::cmp::min(
+            std::time::Duration::from_secs(2),
+            if state
+                .shutdown_flag
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                std::time::Duration::from_millis(100)
+            } else {
+                std::time::Duration::from_secs(2)
+            },
+        );
+        tokio::time::sleep(sleep).await;
+        if state
+            .shutdown_flag
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            break;
+        }
     }
 }
 

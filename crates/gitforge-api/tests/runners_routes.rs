@@ -119,7 +119,7 @@ async fn request_json(
     let response = app
         .oneshot(
             builder
-                .body(Body::from(body.map(|v| v.to_string()).unwrap_or_default()))
+                .body(Body::from(body.map_or_default(|v| v.to_string())))
                 .unwrap(),
         )
         .await
@@ -141,6 +141,18 @@ async fn request_json(
 const REGISTRATION_TOKEN: &str = "test-registration-token";
 
 async fn register(app: Router, body: Value) -> (StatusCode, Value) {
+    let mut body = body;
+    if let Some(object) = body.as_object_mut() {
+        let storage_domain = object
+            .get("storage_domain")
+            .cloned()
+            .unwrap_or_else(|| json!("test-domain"));
+        object.insert("storage_domain".to_string(), storage_domain);
+        object.insert(
+            "capabilities".to_string(),
+            json!([gitforge_common::HOST_STORAGE_LEASE_CAPABILITY]),
+        );
+    }
     request_json(
         app,
         "POST",
@@ -198,15 +210,36 @@ async fn register_without_configured_token_is_disabled() {
 }
 
 #[tokio::test]
+async fn register_without_storage_lease_capability_is_rejected() {
+    let f = seed().await;
+    let (status, body) = request_json(
+        f.app.clone(),
+        "POST",
+        "/api/runners",
+        Some(REGISTRATION_TOKEN),
+        Some(json!({"name": "legacy-runner"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UPGRADE_REQUIRED, "{body}");
+    assert_eq!(body["error"], "runner_capability_required");
+}
+
+#[tokio::test]
 async fn register_creates_then_adopts_by_stable_name() {
     let f = seed().await;
-    let payload = json!({"name": "edge-runner", "type": "docker", "capacity": 3});
+    let payload = json!({
+        "name": "edge-runner",
+        "type": "docker",
+        "capacity": 3,
+        "storage_domain": "shared-nas"
+    });
 
     let (status, created) = register(f.app.clone(), payload.clone()).await;
     assert_eq!(status, StatusCode::CREATED, "{created}");
     assert_eq!(created["name"], "edge-runner");
     assert_eq!(created["type"], "docker");
     assert_eq!(created["capacity"], 3);
+    assert_eq!(created["storage_domain"], "shared-nas");
     let adopted_id = created["id"].as_str().unwrap().to_string();
 
     // A restart re-registers under the same name: same identity, refreshed
@@ -348,6 +381,162 @@ async fn retire_is_idempotent_for_idle_runners() {
 
     let fleet = RunnerQueries::list(&f.pool).await.unwrap();
     assert_eq!(fleet[0].status, "retired");
+}
+
+#[tokio::test]
+async fn runner_pause_requeues_unstarted_jobs_and_keeps_running_jobs_live() {
+    let f = seed().await;
+    let (status, created) = register(
+        f.app.clone(),
+        json!({"name": "pause-runner", "storage_domain": "fedora-local-nvme"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    assert_eq!(created["storage_domain"], "fedora-local-nvme");
+    let runner_id: RunnerId = uuid::Uuid::parse_str(created["id"].as_str().unwrap())
+        .unwrap()
+        .into();
+
+    let run = PipelineRun::new(
+        f.pipeline_id,
+        f.repo_id,
+        "manual".to_string(),
+        "0".repeat(40),
+    );
+    PipelineRunQueries::create(&f.pool, &run).await.unwrap();
+    let mut assigned = Job::new(run.id, "pause-unstarted".to_string());
+    assigned.runner_id = Some(runner_id);
+    assigned.status = JobStatus::Assigned.as_str().to_string();
+    let assigned_id = assigned.id;
+    JobQueries::create(&f.pool, &assigned).await.unwrap();
+    let mut running = Job::new(run.id, "pause-running".to_string());
+    running.runner_id = Some(runner_id);
+    running.status = JobStatus::Running.as_str().to_string();
+    let running_id = running.id;
+    JobQueries::create(&f.pool, &running).await.unwrap();
+
+    let (status, body) = request_json(
+        f.app.clone(),
+        "POST",
+        &format!("/api/runners/{runner_id}/pause"),
+        Some(&f.developer_token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+
+    let (status, body) = request_json(
+        f.app.clone(),
+        "POST",
+        &format!("/api/runners/{runner_id}/pause"),
+        Some(&f.admin_token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["paused"], true);
+    assert_eq!(body["requeued_jobs"], 1);
+    assert_eq!(body["running_jobs"], 1);
+    assert_eq!(body["drain_status"], "draining");
+
+    let persisted = RunnerQueries::get(&f.pool, runner_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(persisted.paused);
+    let requeued = JobQueries::get(&f.pool, assigned_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(requeued.status, "queued");
+    assert_eq!(requeued.runner_id, None);
+    let still_running = JobQueries::get(&f.pool, running_id).await.unwrap().unwrap();
+    assert_eq!(still_running.status, "running");
+
+    // Runner restart registration must not clear an operator pause.
+    let (status, refreshed) = register(f.app.clone(), json!({"name": "pause-runner"})).await;
+    assert_eq!(status, StatusCode::OK, "{refreshed}");
+    assert_eq!(refreshed["paused"], true);
+
+    let (status, body) = request_json(
+        f.app.clone(),
+        "POST",
+        &format!("/api/runners/{runner_id}/resume"),
+        Some(&f.admin_token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["paused"], false);
+    assert!(
+        !RunnerQueries::get(&f.pool, runner_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .paused
+    );
+}
+
+#[tokio::test]
+async fn runner_pause_reports_drained_only_for_current_empty_receipt() {
+    let f = seed().await;
+    let (status, created) = register(f.app.clone(), json!({"name": "receipt-runner"})).await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let runner_id: RunnerId = uuid::Uuid::parse_str(created["id"].as_str().unwrap())
+        .unwrap()
+        .into();
+
+    let pause_url = format!("/api/runners/{runner_id}/pause");
+    let (status, pending) = request_json(
+        f.app.clone(),
+        "POST",
+        &pause_url,
+        Some(&f.admin_token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{pending}");
+    assert_eq!(pending["pause_generation"], 1);
+    assert_eq!(pending["drain_status"], "awaiting_runner_receipt");
+
+    assert!(
+        RunnerQueries::record_drain_receipt(&f.pool, runner_id, 1, &[], &[])
+            .await
+            .unwrap()
+    );
+    let (status, drained) = request_json(
+        f.app.clone(),
+        "POST",
+        &pause_url,
+        Some(&f.admin_token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{drained}");
+    assert_eq!(drained["drain_status"], "drained");
+    assert_eq!(drained["active_job_ids"], json!([]));
+    assert_eq!(drained["owned_container_ids"], json!([]));
+
+    let (status, resumed) = request_json(
+        f.app.clone(),
+        "POST",
+        &format!("/api/runners/{runner_id}/resume"),
+        Some(&f.admin_token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{resumed}");
+    let (status, new_generation) = request_json(
+        f.app.clone(),
+        "POST",
+        &pause_url,
+        Some(&f.admin_token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{new_generation}");
+    assert_eq!(new_generation["pause_generation"], 2);
+    assert_eq!(new_generation["drain_status"], "awaiting_runner_receipt");
 }
 
 #[tokio::test]

@@ -83,6 +83,18 @@ impl JobStateMachine {
 
     /// Transition to assigned state
     pub fn assign(&mut self, runner_id: RunnerId) -> Result<()> {
+        // Re-asserting an assignment is idempotent: the scheduler emits
+        // `JobAssigned` when it dispatches a job, and the completion
+        // consumer replays the same transition when the runner reports
+        // back. The replay must not read as an invalid transition.
+        if self.status == JobStatus::Assigned {
+            if self.runner_id.is_some_and(|current| current != runner_id) {
+                return Err(gitforge_common::Error::invalid_input(
+                    "job is already assigned to another runner",
+                ));
+            }
+            return Ok(());
+        }
         self.ensure_valid_transition(JobStatus::Assigned)?;
         self.status = JobStatus::Assigned;
         self.runner_id = Some(runner_id);
@@ -148,6 +160,20 @@ impl JobStateMachine {
         tracing::info!("job {} skipped", self.job_id);
         Ok(())
     }
+    /// Transition to infrastructure failure state — the container
+    /// backend failed, not the commit (R6.3).
+    pub fn fail_infrastructure(&mut self, exit_code: i32) -> Result<()> {
+        self.ensure_valid_transition(JobStatus::InfrastructureFailure)?;
+        tracing::error!(
+            "job {} infrastructure failure (exit {}): {}",
+            self.job_id,
+            exit_code,
+            "container backend failed, not the commit"
+        );
+        self.status = JobStatus::InfrastructureFailure;
+        self.exit_code = Some(exit_code);
+        Ok(())
+    }
 
     /// Check if the job is in a terminal state
     pub fn is_terminal(&self) -> bool {
@@ -183,16 +209,23 @@ impl JobStateMachine {
             // runner that hung before reporting assignment/progress still sits
             // at Queued here while the database records it Running. The
             // durable deadline is authoritative, so allow the reaping.
+            (JobStatus::Assigned, JobStatus::InfrastructureFailure) => true,
             (JobStatus::Queued, JobStatus::TimedOut) => true,
 
             // From assigned
             (JobStatus::Assigned, JobStatus::Running) => true,
+            // A job that fails while it is assigned to a runner never
+            // reaches `Running` in this mirror: the runner reports the
+            // failure, and the mirror is still at `Assigned` (the
+            // assignment is asserted when the job is dispatched).
+            (JobStatus::Assigned, JobStatus::Failed) => true,
             (JobStatus::Assigned, JobStatus::Cancelled) => true,
             // Same watchdog rationale as the Queued case above.
             (JobStatus::Assigned, JobStatus::TimedOut) => true,
 
             // From running
             (JobStatus::Running, JobStatus::Succeeded) => true,
+            (JobStatus::Running, JobStatus::InfrastructureFailure) => true,
             (JobStatus::Running, JobStatus::Failed) => true,
             (JobStatus::Running, JobStatus::TimedOut) => true,
             (JobStatus::Running, JobStatus::Cancelled) => true,
@@ -523,5 +556,38 @@ mod tests {
         let mut done = JobStateMachine::new(JobId::new());
         done.restore(JobStatus::Succeeded, Some(started));
         assert!(done.is_terminal());
+    }
+    #[test]
+    fn test_infrastructure_failure_from_running() {
+        let mut state = JobStateMachine::new(JobId::new());
+        state.queue().unwrap();
+        state.assign(RunnerId::new()).unwrap();
+        state.start().unwrap();
+        state.fail_infrastructure(137).unwrap();
+        assert!(state.is_terminal());
+        assert_eq!(state.status(), JobStatus::InfrastructureFailure);
+        assert_eq!(state.exit_code(), Some(137));
+    }
+
+    #[test]
+    fn test_infrastructure_failure_from_assigned() {
+        let mut state = JobStateMachine::new(JobId::new());
+        state.queue().unwrap();
+        state.assign(RunnerId::new()).unwrap();
+        state.fail_infrastructure(137).unwrap();
+        assert!(state.is_terminal());
+        assert_eq!(state.status(), JobStatus::InfrastructureFailure);
+    }
+
+    #[test]
+    fn test_infrastructure_failure_cannot_return_from_terminal() {
+        let mut state = JobStateMachine::new(JobId::new());
+        state.queue().unwrap();
+        state.assign(RunnerId::new()).unwrap();
+        state.start().unwrap();
+        state.fail_infrastructure(137).unwrap();
+        // Terminal states cannot transition further
+        assert!(state.fail(1, "nope".to_string()).is_err());
+        assert!(state.succeed(0).is_err());
     }
 }

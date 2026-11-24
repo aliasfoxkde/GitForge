@@ -20,8 +20,6 @@ if [[ ! "$release_id" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
   exit 64
 fi
 
-"$(dirname "$0")/gitforge-release-preflight" "$source_root"
-
 source_commit="${GITFORGE_SOURCE_COMMIT:-}"
 if [[ -z "$source_commit" ]]; then
   source_commit=$(git -C "$source_root" rev-parse HEAD 2>/dev/null || true)
@@ -31,18 +29,13 @@ if [[ ! "$source_commit" =~ ^[0-9a-f]{40}$ ]]; then
   exit 1
 fi
 
+# The preflight now carries the commit, so it can also prove that the
+# candidate binaries are the ones this bundle claims to ship.
+"$(dirname "$0")/gitforge-release-preflight" "$source_root" "$source_commit"
+
 # A cut may only assemble on top of a full, honest green for this exact
 # commit (see scripts/gitforge-release-gate).
 "$(dirname "$0")/gitforge-release-gate" "$source_commit"
-
-toolchain="${GITFORGE_TOOLCHAIN:-}"
-if [[ -z "$toolchain" ]]; then
-  toolchain=$(rustc --version 2>/dev/null || true)
-fi
-if [[ -z "$toolchain" ]]; then
-  printf 'release bundle: build toolchain is required (set GITFORGE_TOOLCHAIN or install rustc)\n' >&2
-  exit 1
-fi
 
 release_dir="$bundle_root/$release_id"
 if [[ -e "$release_dir" ]]; then
@@ -65,6 +58,18 @@ if [[ -e "$staging_dir" ]]; then
   find "$staging_dir" -depth -delete
 fi
 
+# A failed cut must not leave a staging tree behind. The next attempt
+# clears it, but a tree that outlives its cut is a directory in the bundle
+# root that looks like a release to anything listing it.
+cleanup_staging() {
+  local status=$?
+  if [[ -d "$staging_dir" ]]; then
+    find "$staging_dir" -depth -delete 2>/dev/null || true
+  fi
+  exit "$status"
+}
+trap cleanup_staging ERR
+
 mkdir -p "$staging_dir/bin" "$staging_dir/scripts" "$staging_dir/systemd/user"
 
 # The services run as the unprivileged `gitforge` user, which reaches the
@@ -84,6 +89,12 @@ for binary in api ci git-server runner; do
   install -m 0755 "$source_root/$binary" "$staging_dir/bin/$binary"
 done
 
+# Prove the staged bytes carry the claimed commit BEFORE the bundle is
+# published. The verify step below runs after the atomic rename, and a
+# bundle that fails there would sit at the final name, blocking every retry
+# behind the overwrite refusal (GF-14, 2026-11-05).
+"$(dirname "$0")/gitforge-release-stamps" "$staging_dir/bin" "$source_commit"
+
 install -m 0755 "$source_root/scripts/gitforge-status" "$staging_dir/scripts/gitforge-status"
 
 for unit in gitforge-ci.service.example gitforge-runner.service.example; do
@@ -94,14 +105,21 @@ for policy in gitforge-resource-limits.conf gitforge-ci-resource-limits.conf git
   install -m 0644 "$(dirname "$0")/../systemd/user/$policy" "$staging_dir/systemd/user/$policy"
 done
 
-build_timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+# The metadata has to describe the ARTIFACT, so it is read out of the
+# binaries the bundle ships. Taking it from the cutting host instead made
+# the bundle claim the toolchain of the machine that assembled it while the
+# binaries were compiled elsewhere (GF-15, 2026-11-06).
+build_toolchain=$("$(dirname "$0")/gitforge-release-stamps" --field toolchain "$staging_dir/bin")
+build_timestamp=$("$(dirname "$0")/gitforge-release-stamps" --field built "$staging_dir/bin")
+cut_timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 (
   cd "$staging_dir"
   cat > RELEASE_METADATA.txt <<EOF
 release_id=$release_id
 source_commit=$source_commit
 build_timestamp_utc=$build_timestamp
-toolchain=$toolchain
+toolchain=$build_toolchain
+bundle_cut_utc=$cut_timestamp
 EOF
   cat > READY <<EOF
 release_id=$release_id
@@ -117,6 +135,10 @@ EOF
 # cutting the same release id won the race) instead of nesting the staging
 # tree inside the existing directory the way plain mv would.
 mv -T "$staging_dir" "$release_dir"
+
+# The bundle is published; the staging tree no longer exists, so the
+# cleanup trap has nothing left to do.
+trap - ERR
 
 # Verify the assembled bundle with the same verifier a consumer would run:
 # a cut that cannot pass its own contract must not be publishable.

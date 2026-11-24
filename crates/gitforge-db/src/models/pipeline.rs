@@ -80,6 +80,12 @@ pub struct PipelineRun {
     /// Git ref the run was triggered for. `None` for rows that predate the
     /// column; supersede filtering skips such runs rather than guessing.
     pub ref_name: Option<String>,
+    /// The commit the pushed ref pointed at *before* the push. `None` for
+    /// runs that predate the column or that were not triggered by a push.
+    ///
+    /// This is the only base that describes the whole push: a push may
+    /// carry several commits, and the tip commit alone is not the push.
+    pub push_base_sha: Option<String>,
 }
 
 impl PipelineRun {
@@ -102,6 +108,7 @@ impl PipelineRun {
             created_at: Utc::now(),
             error: None,
             ref_name: None,
+            push_base_sha: None,
         }
     }
 

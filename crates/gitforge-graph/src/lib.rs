@@ -302,16 +302,14 @@ impl DependencyGraph {
     pub fn dependencies_of(&self, crate_name: &str) -> Vec<String> {
         self.deps
             .get(crate_name)
-            .map(|s| s.iter().cloned().collect())
-            .unwrap_or_default()
+            .map_or_default(|s| s.iter().cloned().collect())
     }
 
     /// Direct dependents of a crate.
     pub fn dependents_of(&self, crate_name: &str) -> Vec<String> {
         self.rdeps
             .get(crate_name)
-            .map(|s| s.iter().cloned().collect())
-            .unwrap_or_default()
+            .map_or_default(|s| s.iter().cloned().collect())
     }
 
     /// All known crate names.

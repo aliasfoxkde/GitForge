@@ -83,6 +83,9 @@ mod tests {
             runner_type: "docker".to_string(),
             status: status.to_string(),
             capacity,
+            storage_domain: "test-domain".to_string(),
+            paused: false,
+            pause_generation: 0,
             last_heartbeat: None,
             created_at: chrono::Utc::now(),
         }

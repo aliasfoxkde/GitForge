@@ -127,7 +127,7 @@ All API endpoints require JWT authentication except the public set: `/health`, `
 
 Token format:
 - Algorithm: HS256
-- Expiry: 24 hours
+- Expiry: 7 days (refresh credential: 30-day sliding window)
 - Claims: user_id, username, role
 
 ### CORS

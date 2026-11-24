@@ -1,8 +1,10 @@
 //! Job scheduler
 
+use crate::io_pressure::HostIoPressure;
 use crate::policy::{SchedulingPolicy, SimplePolicy};
 use crate::queue::{JobQueue, Priority, QueuedJob};
-use gitforge_common::{JobId, Lane, PipelineRunId, RepoId, RunnerId, VolumeSpec};
+use crate::resource_class::cargo_build_workload;
+use gitforge_common::{JobId, JobRowState, Lane, PipelineRunId, RepoId, RunnerId, VolumeSpec};
 use gitforge_db::models::{
     Job as DbJob, JobStatus, PipelineRun as DbPipelineRun, Runner,
     RUNNER_HEARTBEAT_OFFLINE_AFTER_SECS,
@@ -12,6 +14,7 @@ use gitforge_metrics::Metrics;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, RwLock, RwLockWriteGuard};
 use uuid::Uuid;
 
@@ -57,6 +60,7 @@ pub fn lane_limit(lane: Lane, env_value: Option<&str>) -> Option<usize> {
 /// while standard/heavy jobs wait. Above this, a fast job defers with
 /// `fast_reserved_capacity` until non-fast work drains (or ages through).
 const FAST_RESERVED_CAPACITY_FRACTION: f64 = 0.5;
+const HOST_STORAGE_LEASE_RETRY_BACKOFF: Duration = Duration::from_secs(10);
 
 /// A durable deferral reason names the resource a job is waiting for
 /// (#338). Surfaced through queue status; never a silent `queued`.
@@ -65,6 +69,28 @@ pub enum DeferredReason {
     LaneLimit,
     FastReservedCapacity,
     ScratchHeadroom,
+    /// The job's exclusive resource class was already in flight on every
+    /// runner that had capacity. The class is an admission rule of the
+    /// scheduler, so the exclusion has to be named: a job blocked by it used
+    /// to sit queued with no reason at all (GF-14).
+    ResourceClassConflict,
+    /// The host's I/O PSI is above the admission limit for compile-heavy work.
+    HostIoPressure,
+    /// Linux I/O PSI is missing or malformed, so compile-heavy work fails closed.
+    HostIoPressureUnavailable,
+    /// A host Cargo/compiler process is already active.
+    HostBuildActive,
+    /// The scheduler could not inspect host compiler processes.
+    HostBuildProbeUnavailable,
+    /// Another storage-heavy job already holds this scheduler's host slot.
+    HostStorageSlotBusy,
+    /// The runner's cross-process host lease was busy after this job had
+    /// already been assigned.
+    HostResourceAdmissionBusy,
+    /// Host CPU pressure is above the resource-admission limit.
+    HostCpuPressure,
+    /// The scheduler could not inspect host CPU pressure.
+    HostCpuPressureUnavailable,
 }
 
 impl DeferredReason {
@@ -73,6 +99,32 @@ impl DeferredReason {
             DeferredReason::LaneLimit => "lane_limit",
             DeferredReason::FastReservedCapacity => "fast_reserved_capacity",
             DeferredReason::ScratchHeadroom => "scratch_headroom",
+            DeferredReason::ResourceClassConflict => "resource_class_conflict",
+            DeferredReason::HostIoPressure => "host_io_pressure",
+            DeferredReason::HostIoPressureUnavailable => "host_io_pressure_unavailable",
+            DeferredReason::HostBuildActive => "host_build_active",
+            DeferredReason::HostBuildProbeUnavailable => "host_build_probe_unavailable",
+            DeferredReason::HostStorageSlotBusy => "host_storage_slot_busy",
+            DeferredReason::HostResourceAdmissionBusy => "host_resource_admission_busy",
+            DeferredReason::HostCpuPressure => "host_cpu_pressure",
+            DeferredReason::HostCpuPressureUnavailable => "host_cpu_pressure_unavailable",
+        }
+    }
+}
+
+fn host_io_deferred_reason(reason: crate::io_pressure::HostIoDeferral) -> DeferredReason {
+    match reason {
+        crate::io_pressure::HostIoDeferral::CpuPressure => DeferredReason::HostCpuPressure,
+        crate::io_pressure::HostIoDeferral::CpuPressureUnavailable => {
+            DeferredReason::HostCpuPressureUnavailable
+        }
+        crate::io_pressure::HostIoDeferral::Pressure => DeferredReason::HostIoPressure,
+        crate::io_pressure::HostIoDeferral::PressureUnavailable => {
+            DeferredReason::HostIoPressureUnavailable
+        }
+        crate::io_pressure::HostIoDeferral::ActiveBuild => DeferredReason::HostBuildActive,
+        crate::io_pressure::HostIoDeferral::ProcessProbeUnavailable => {
+            DeferredReason::HostBuildProbeUnavailable
         }
     }
 }
@@ -212,8 +264,18 @@ pub enum SchedulerCommand {
 /// Scheduler event
 #[derive(Debug, Clone)]
 pub enum SchedulerEvent {
-    /// Job assigned to runner
-    JobAssigned { job_id: JobId, runner_id: RunnerId },
+    /// Job assigned to runner.
+    ///
+    /// The run id travels with the event: the CI service keys its engines
+    /// by run, and the engine's mirror has to leave `Queued` when the job
+    /// is dispatched. A dispatched job that stays `Queued` in the mirror
+    /// is re-released by every later completion of the run, and that
+    /// duplicate enqueue demoted the running job's durable row (GF-12).
+    JobAssigned {
+        job_id: JobId,
+        runner_id: RunnerId,
+        pipeline_run_id: PipelineRunId,
+    },
     /// No runner available for job
     NoRunnerAvailable { job_id: JobId },
     /// Runner submitted a terminal job receipt.
@@ -222,6 +284,7 @@ pub enum SchedulerEvent {
         pipeline_run_id: PipelineRunId,
         runner_id: RunnerId,
         success: bool,
+        outcome: JobOutcome,
     },
 }
 
@@ -246,6 +309,10 @@ pub struct SchedulerState {
     /// In-memory mirror of each queued job's last deferral reason (#338),
     /// served by queue status between durable writes.
     pub deferred_reasons: HashMap<JobId, String>,
+    /// Short-lived runner cooldown after a local storage lease conflict.
+    /// This prevents immediate assign/defer churn; physical host/device
+    /// identity is still required for fleet-wide placement decisions.
+    pub storage_lease_blocked_runners: HashMap<RunnerId, Instant>,
 }
 
 /// The scheduler-facing portion of a CI job definition. It is deliberately
@@ -255,6 +322,13 @@ pub struct SchedulerState {
 pub struct JobExecutionDefinition {
     pub commands: Vec<String>,
     pub image: String,
+    /// Explicit host path to the shared run workspace. `working_dir` is kept
+    /// as a legacy mirror on assignment for older runners.
+    pub workspace_path: Option<String>,
+    /// Container cwd for each command execution; never a host-side path.
+    pub container_working_dir: Option<String>,
+    /// Per-command container cwd, aligned with `commands`.
+    pub step_working_directories: Vec<Option<String>>,
     pub working_dir: Option<String>,
     /// Maximum seconds allowed for each runner step. Older callers that do
     /// not provide a value retain the safe legacy default.
@@ -280,25 +354,16 @@ pub struct JobExecutionDefinition {
 
 pub const DEFAULT_JOB_TIMEOUT_SECS: u64 = 300;
 
-/// Return the scheduler resource class for jobs that must not overlap on one
-/// runner. Workspace-wide Cargo tests contend for the same checkout and build
-/// artifacts, so a runner admits at most one of them at a time.
+/// Return the scheduler resource class for Cargo compilation work. A runner
+/// admits one such job at a time to bound aggregate compiler I/O and avoid
+/// overlapping target-tree operations; non-Cargo and fast-lane work retains
+/// the runner's remaining capacity.
 fn resource_class(definition: &JobExecutionDefinition) -> Option<&'static str> {
     definition
         .commands
         .iter()
-        .any(|command| {
-            command
-                .split_whitespace()
-                .any(|argument| argument == "cargo")
-                && command
-                    .split_whitespace()
-                    .any(|argument| argument == "test")
-                && command
-                    .split_whitespace()
-                    .any(|argument| argument == "--workspace")
-        })
-        .then_some("workspace-cargo-test")
+        .any(|command| cargo_build_workload(command))
+        .then_some("cargo-build")
 }
 
 fn runner_has_resource_class_conflict(
@@ -337,6 +402,7 @@ impl SchedulerState {
             job_leases: HashMap::new(),
             cancelled_jobs: std::collections::HashSet::new(),
             deferred_reasons: HashMap::new(),
+            storage_lease_blocked_runners: HashMap::new(),
         }
     }
 
@@ -359,7 +425,10 @@ impl SchedulerState {
         let now = chrono::Utc::now();
         self.runners
             .values()
-            .filter(|r| r.effective_status(now, RUNNER_HEARTBEAT_OFFLINE_AFTER_SECS) == "online")
+            .filter(|r| {
+                !r.paused
+                    && r.effective_status(now, RUNNER_HEARTBEAT_OFFLINE_AFTER_SECS) == "online"
+            })
             .cloned()
             .collect()
     }
@@ -479,6 +548,47 @@ impl Scheduler {
             || state.queue.contains(job_id)
     }
 
+    /// Resolve the authoritative store's view of a batch of job ids.
+    ///
+    /// The answer comes from the durable store only. A scheduler without a
+    /// store cannot speak for jobs another process planned, so it answers
+    /// `Unknown` for every id — the fail-closed answer, because `Unknown`
+    /// is the one that never turns into a removal.
+    ///
+    /// The distinction matters because the runner stamps a job-shaped id on
+    /// every container it creates, including the warm-pool containers that
+    /// were never given to a job. A real job always has a durable row: the
+    /// row is written when the job is enqueued, which is before the job can
+    /// be dispatched to a runner.
+    pub async fn job_row_states(&self, job_ids: &[JobId]) -> HashMap<JobId, JobRowState> {
+        let mut states: HashMap<JobId, JobRowState> = job_ids
+            .iter()
+            .map(|job_id| (*job_id, JobRowState::Unknown))
+            .collect();
+        let Some(pool) = &self.db_pool else {
+            return states;
+        };
+        let loaded = match gitforge_db::queries::JobQueries::get_many(pool, job_ids).await {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "job existence lookup failed; every id stays unknown"
+                );
+                return states;
+            }
+        };
+        for job_id in job_ids {
+            let state = if loaded.contains_key(job_id) {
+                JobRowState::Present
+            } else {
+                JobRowState::Absent
+            };
+            states.insert(*job_id, state);
+        }
+        states
+    }
+
     /// Read a durable pipeline run for the CI status adapter.
     pub async fn get_pipeline_run(
         &self,
@@ -558,6 +668,9 @@ impl Scheduler {
                 commands,
                 image,
                 working_dir,
+                workspace_path: None,
+                container_working_dir: None,
+                step_working_directories: Vec::new(),
                 timeout_secs: DEFAULT_JOB_TIMEOUT_SECS,
                 env: HashMap::new(),
                 volumes: Vec::new(),
@@ -585,9 +698,33 @@ impl Scheduler {
         job_id: JobId,
         pipeline_run_id: PipelineRunId,
         repo_id: RepoId,
-        definition: JobExecutionDefinition,
+        mut definition: JobExecutionDefinition,
     ) -> anyhow::Result<()> {
+        // Pre-v2 callers put the host workspace in `working_dir`. Preserve
+        // that contract as an explicit workspace path while newer CI callers
+        // send the host and container paths independently.
+        if definition.workspace_path.is_none()
+            && definition.container_working_dir.is_none()
+            && definition.working_dir.is_some()
+        {
+            definition.workspace_path = definition.working_dir.clone();
+        }
         let timeout_secs = definition.timeout_secs.clamp(5, 24 * 60 * 60);
+        // A job this scheduler already dispatched is live: its durable row
+        // is `assigned`/`running` and its runner holds the lease. Queueing
+        // it again demotes that row, which refuses the runner's heartbeat
+        // and rotates its lease token out from under it (GF-12). The
+        // enqueue of a live job is a no-op.
+        {
+            let state = self.state.read().await;
+            if state.assigned_jobs.contains_key(&job_id) {
+                tracing::debug!(
+                    %job_id,
+                    "job is already dispatched; the duplicate enqueue is a no-op"
+                );
+                return Ok(());
+            }
+        }
         if let Some(pool) = &self.db_pool {
             let mut db_job = DbJob::new(pipeline_run_id, format!("job-{job_id}"));
             db_job.id = job_id;
@@ -608,13 +745,26 @@ impl Scheduler {
                 })
                 .await?;
             }
-            persist_with_retry("status update", job_id, || {
-                gitforge_db::queries::JobQueries::update_status(pool, job_id, "queued")
-            })
-            .await?;
+            // The durable status of a job a runner holds is the invariant
+            // every later write is fenced by. Moving such a row back to
+            // `queued` takes the lease away from the runner that holds it
+            // (GF-12), so the transition is guarded: a row that is not
+            // dispatchable stays as it is and is not queued again.
+            let dispatchable =
+                gitforge_db::queries::JobQueries::mark_queued_if_dispatchable(pool, job_id).await?;
+            if !dispatchable {
+                tracing::debug!(
+                    %job_id,
+                    "job row is live; the enqueue leaves it to the runner that holds it"
+                );
+                return Ok(());
+            }
             let commands = definition.commands.clone();
             let image = definition.image.clone();
             let working_dir = definition.working_dir.clone();
+            let workspace_path = definition.workspace_path.clone();
+            let container_working_dir = definition.container_working_dir.clone();
+            let step_working_directories = definition.step_working_directories.clone();
             let lane = definition.lane;
             persist_with_retry("definition write", job_id, || {
                 gitforge_db::queries::JobQueries::set_definition_full(
@@ -622,7 +772,10 @@ impl Scheduler {
                     job_id,
                     &commands,
                     &image,
+                    workspace_path.as_deref(),
+                    container_working_dir.as_deref(),
                     working_dir.as_deref(),
+                    &step_working_directories,
                     timeout_secs,
                     lane,
                 )
@@ -641,6 +794,9 @@ impl Scheduler {
                 commands: definition.commands.clone(),
                 image: definition.image.clone(),
                 working_dir: definition.working_dir.clone(),
+                workspace_path: definition.workspace_path.clone(),
+                container_working_dir: definition.container_working_dir.clone(),
+                step_working_directories: definition.step_working_directories.clone(),
                 timeout_secs,
                 env: definition.env.clone(),
                 volumes: definition.volumes.clone(),
@@ -675,8 +831,7 @@ impl Scheduler {
             let lane = state
                 .job_definitions
                 .get(&job_id)
-                .map(|definition| definition.lane)
-                .unwrap_or_default();
+                .map_or_default(|definition| definition.lane);
             metrics.record_job_deferral(lane.as_str(), reason.as_str());
         }
         if let Some(pool) = &self.db_pool {
@@ -900,6 +1055,47 @@ impl Scheduler {
         updated
     }
 
+    /// Read the durable runner control state returned to its heartbeat loop.
+    pub async fn runner_control(&self, runner_id: RunnerId) -> Option<(bool, i64)> {
+        if let Some(pool) = &self.db_pool {
+            return match gitforge_db::queries::RunnerQueries::get(pool, runner_id).await {
+                Ok(Some(runner)) => Some((runner.paused, runner.pause_generation)),
+                Ok(None) => None,
+                Err(error) => {
+                    tracing::warn!(%error, %runner_id, "failed to read runner control state");
+                    None
+                }
+            };
+        }
+        self.state
+            .read()
+            .await
+            .get_runner(runner_id)
+            .map(|runner| (runner.paused, runner.pause_generation))
+    }
+
+    /// Persist a drain snapshot only when it matches the current paused
+    /// generation. A stale runner heartbeat cannot complete a newer drain.
+    pub async fn record_runner_drain_receipt(
+        &self,
+        runner_id: RunnerId,
+        generation: i64,
+        active_job_ids: &[String],
+        owned_container_ids: &[String],
+    ) -> gitforge_common::Result<bool> {
+        let Some(pool) = &self.db_pool else {
+            return Ok(false);
+        };
+        gitforge_db::queries::RunnerQueries::record_drain_receipt(
+            pool,
+            runner_id,
+            generation,
+            active_job_ids,
+            owned_container_ids,
+        )
+        .await
+    }
+
     /// Handle runner going offline
     pub async fn runner_offline(&self, runner_id: RunnerId) {
         let mut state = self.state.write().await;
@@ -1025,6 +1221,9 @@ impl Scheduler {
                         commands: job.commands.clone(),
                         image: job.image.clone(),
                         working_dir: job.working_dir.clone(),
+                        workspace_path: job.workspace_path.clone(),
+                        container_working_dir: job.container_working_dir.clone(),
+                        step_working_directories: job.step_working_directories.clone(),
                         timeout_secs: job.timeout_secs,
                         // The durable jobs table has no env column (see
                         // load_pending_jobs): this definition is only used if
@@ -1257,6 +1456,7 @@ impl Scheduler {
                 pipeline_run_id,
                 runner_id,
                 success: false,
+                outcome: JobOutcome::Failed,
             });
         }
 
@@ -1265,6 +1465,11 @@ impl Scheduler {
 
     /// Try to assign jobs to available runners
     pub async fn process_queue(&self) {
+        self.process_queue_with_io_pressure(HostIoPressure::read_system())
+            .await;
+    }
+
+    pub(crate) async fn process_queue_with_io_pressure(&self, io_pressure: HostIoPressure) {
         if self.db_pool.is_some() && !self.recovery_done.swap(true, Ordering::AcqRel) {
             if let Some(pool) = &self.db_pool {
                 match gitforge_db::queries::JobQueries::requeue_inflight(
@@ -1332,6 +1537,14 @@ impl Scheduler {
                 marked_offline,
                 "reconciled stale runners during queue processing"
             );
+        }
+
+        // Runner pause is written by the separate API gateway. Refresh its
+        // durable control state before placement so this scheduler's memory
+        // cannot continue offering work to a paused runner.
+        if let Err(error) = self.refresh_durable_runner_controls().await {
+            tracing::error!(%error, "failed to refresh durable runner controls");
+            return;
         }
 
         // Keep the scheduler responsive to jobs submitted by the separate API
@@ -1447,15 +1660,42 @@ impl Scheduler {
                     }
                 };
             for job_id in assigned_ids {
-                if assigned_jobs
-                    .get(&job_id)
-                    .is_some_and(|job| job.status == "cancelled")
-                {
-                    self.cancel(job_id).await;
+                match assigned_jobs.get(&job_id) {
+                    Some(job) if job.status == "cancelled" => self.cancel(job_id).await,
+                    // The API may atomically requeue an assigned-but-not-
+                    // started job while pausing its runner. Drop the stale
+                    // scheduler mirror and restore the durable queued row.
+                    Some(job) if job.status == "queued" => {
+                        let mut state = self.state.write().await;
+                        if let Some((_, pipeline_run_id, repo_id)) =
+                            state.assigned_jobs.remove(&job_id)
+                        {
+                            state.job_assignments.remove(&job_id);
+                            state.job_leases.remove(&job_id);
+                            if !state.queue.contains(job_id) {
+                                state.queue.enqueue(QueuedJob::new(
+                                    job_id,
+                                    pipeline_run_id,
+                                    repo_id,
+                                ));
+                            }
+                            state.deferred_reasons.insert(
+                                job_id,
+                                job.deferred_reason
+                                    .clone()
+                                    .unwrap_or_else(|| "durable_requeue".to_string()),
+                            );
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
         let mut state = self.state.write().await;
+        let now = Instant::now();
+        state
+            .storage_lease_blocked_runners
+            .retain(|_, retry_at| *retry_at > now);
         let runners = state.list_online_runners();
         let available_capacity: usize = runners
             .iter()
@@ -1482,8 +1722,7 @@ impl Scheduler {
             let lane = state
                 .job_definitions
                 .get(job_id)
-                .map(|definition| definition.lane)
-                .unwrap_or_default();
+                .map_or_default(|definition| definition.lane);
             *lane_running.entry(lane).or_default() += 1;
         }
         let lane_limits: HashMap<Lane, Option<usize>> = self.lane_limits.clone();
@@ -1516,6 +1755,15 @@ impl Scheduler {
             let job_queued_at = job.queued_at;
             let definition = state.job_definitions.get(&job_id).cloned();
 
+            // Compile and Heavy-lane jobs are storage-sensitive. Admission
+            // below is scoped to each runner's declared storage domain.
+            let pressure_sensitive = job_lane == Lane::Heavy
+                || definition
+                    .as_ref()
+                    .is_some_and(|definition| resource_class(definition).is_some());
+            let host_pressure_deferral =
+                pressure_sensitive.then(|| io_pressure.deferral()).flatten();
+
             // Lane admission (#338). A deferral is durable and explainable:
             // the job stays queued with a recorded reason instead of a bare
             // 'queued', and the walk moves on so one blocked lane cannot
@@ -1544,6 +1792,35 @@ impl Scheduler {
 
             // Select runner using policy
             let mut available = runners.clone();
+            // A runner whose free slot is taken away by the exclusive resource
+            // class is a different block from a runner that is simply busy:
+            // only the class is an admission rule of the scheduler, so
+            // remember when the class is what removed the capacity.
+            let mut class_conflict_blocked = false;
+            let mut host_storage_lease_blocked = false;
+            let mut storage_domain_blocked = false;
+            let mut host_pressure_blocked = None;
+            // Restart recovery can re-adopt a live job before that runner
+            // reconnects and republishes its storage domain. Until then we
+            // cannot prove which storage domain is busy, so fail closed for
+            // storage-sensitive work instead of treating the missing
+            // metadata as an idle domain.
+            let unknown_storage_domain_busy = pressure_sensitive
+                && state.assigned_jobs.iter().any(
+                    |(assigned_job_id, (assigned_runner_id, _, _))| {
+                        let storage_sensitive = state
+                            .job_definitions
+                            .get(assigned_job_id)
+                            .is_none_or(|assigned| {
+                                assigned.lane == Lane::Heavy || resource_class(assigned).is_some()
+                            });
+                        let domain_unknown = state
+                            .runners
+                            .get(assigned_runner_id)
+                            .is_none_or(|runner| runner.storage_domain.trim().is_empty());
+                        storage_sensitive && domain_unknown
+                    },
+                );
             for runner in &mut available {
                 let in_flight = state
                     .assigned_jobs
@@ -1553,8 +1830,46 @@ impl Scheduler {
                 runner.capacity = (runner.capacity - in_flight).max(0);
                 if let Some(definition) = &definition {
                     if runner_has_resource_class_conflict(&state, runner.id, definition) {
+                        if runner.capacity > 0 {
+                            class_conflict_blocked = true;
+                        }
                         runner.capacity = 0;
                     }
+                }
+                if pressure_sensitive {
+                    let domain_busy = unknown_storage_domain_busy
+                        || state.assigned_jobs.iter().any(
+                            |(assigned_job_id, (assigned_runner_id, _, _))| {
+                                state.runners.get(assigned_runner_id).is_some_and(
+                                    |assigned_runner| {
+                                        assigned_runner.storage_domain == runner.storage_domain
+                                    },
+                                ) && state.job_definitions.get(assigned_job_id).is_some_and(
+                                    |assigned| {
+                                        assigned.lane == Lane::Heavy
+                                            || resource_class(assigned).is_some()
+                                    },
+                                )
+                            },
+                        );
+                    if domain_busy && runner.capacity > 0 {
+                        storage_domain_blocked = true;
+                        runner.capacity = 0;
+                    }
+                    if runner.storage_domain == io_pressure.storage_domain() {
+                        if let Some(reason) = host_pressure_deferral {
+                            if runner.capacity > 0 {
+                                host_pressure_blocked = Some(host_io_deferred_reason(reason));
+                                runner.capacity = 0;
+                            }
+                        }
+                    }
+                }
+                if pressure_sensitive
+                    && state.storage_lease_blocked_runners.contains_key(&runner.id)
+                {
+                    host_storage_lease_blocked |= runner.capacity > 0;
+                    runner.capacity = 0;
                 }
             }
             let runner_id = self.policy.select_runner(job_id, &available).await;
@@ -1581,7 +1896,18 @@ impl Scheduler {
                             Ok(true) => {}
                             Ok(false) => {
                                 state.queue.remove(job_id);
-                                state.job_leases.remove(&job_id);
+                                // The durable row refused the assignment
+                                // because it is already held. If this
+                                // scheduler still mirrors the job as
+                                // assigned, the runner holds the lease this
+                                // scheduler gave it: dropping the mirror's
+                                // lease here would make every completion it
+                                // sends fail the in-memory lease check, and
+                                // the job would be fenced as lost while it
+                                // is running (GF-12).
+                                if !state.assigned_jobs.contains_key(&job_id) {
+                                    state.job_leases.remove(&job_id);
+                                }
                                 tracing::debug!(%job_id, "job assignment won by another scheduler");
                                 continue;
                             }
@@ -1619,6 +1945,7 @@ impl Scheduler {
                     let event = SchedulerEvent::JobAssigned {
                         job_id,
                         runner_id: r_id,
+                        pipeline_run_id,
                     };
                     let _ = self.event_tx.send(event);
                 }
@@ -1626,10 +1953,54 @@ impl Scheduler {
                     // No runner can take this job right now. Leave it queued
                     // and consider the next one so a single blocked job cannot
                     // idle the runner's remaining capacity.
-                    tracing::debug!(
-                        "no runner available for job {}, skipping to next queued job",
-                        job_id
-                    );
+                    if let Some(reason) = host_pressure_blocked {
+                        tracing::debug!(
+                            %job_id,
+                            reason = reason.as_str(),
+                            storage_domain = io_pressure.storage_domain(),
+                            "job deferred by host-local resource pressure"
+                        );
+                        self.record_deferral(&mut state, job_id, reason);
+                    } else if storage_domain_blocked {
+                        tracing::debug!(
+                            %job_id,
+                            "job deferred: storage-sensitive work is active in every eligible storage domain"
+                        );
+                        self.record_deferral(
+                            &mut state,
+                            job_id,
+                            DeferredReason::HostStorageSlotBusy,
+                        );
+                    } else if host_storage_lease_blocked {
+                        tracing::debug!(
+                            "job {} deferred: runner host resource admission is busy or pressure-blocked",
+                            job_id
+                        );
+                        self.record_deferral(
+                            &mut state,
+                            job_id,
+                            DeferredReason::HostResourceAdmissionBusy,
+                        );
+                    } else if class_conflict_blocked {
+                        // The exclusive resource class is what removed the
+                        // capacity of every runner that had any. Name it
+                        // durably: a job blocked by the class used to sit
+                        // queued with no reason at all (GF-14).
+                        tracing::debug!(
+                            "job {} deferred: resource class already in flight",
+                            job_id
+                        );
+                        self.record_deferral(
+                            &mut state,
+                            job_id,
+                            DeferredReason::ResourceClassConflict,
+                        );
+                    } else {
+                        tracing::debug!(
+                            "no runner available for job {}, skipping to next queued job",
+                            job_id
+                        );
+                    }
                     skipped.insert(job_id);
                 }
             }
@@ -1638,6 +2009,25 @@ impl Scheduler {
         if processed > 0 {
             tracing::debug!("batch assigned {} jobs", processed);
         }
+    }
+
+    async fn refresh_durable_runner_controls(&self) -> anyhow::Result<()> {
+        let Some(pool) = &self.db_pool else {
+            return Ok(());
+        };
+        let durable_runners = gitforge_db::queries::RunnerQueries::list(pool).await?;
+        let mut state = self.state.write().await;
+        for durable in durable_runners {
+            if let Some(existing) = state.runners.get_mut(&durable.id) {
+                existing.status = durable.status;
+                existing.capacity = durable.capacity;
+                existing.paused = durable.paused;
+                existing.last_heartbeat = durable.last_heartbeat;
+            } else {
+                state.add_runner(durable);
+            }
+        }
+        Ok(())
     }
 
     /// Load pending jobs from database
@@ -1680,12 +2070,19 @@ impl Scheduler {
                     db_job.pipeline_run_id,
                     run.repo_id,
                 ));
-                state.job_definitions.insert(
-                    db_job.id,
+                // A local assignment may have been returned to the durable
+                // queue by another API process. Preserve its richer in-memory
+                // execution definition; DB rows intentionally do not carry
+                // pipeline env/volume data. Build the fallback only when the
+                // scheduler truly has no definition (startup recovery).
+                state.job_definitions.entry(db_job.id).or_insert_with(|| {
                     JobExecutionDefinition {
                         commands: db_job.commands,
                         image: db_job.image,
                         working_dir: db_job.working_dir,
+                        workspace_path: db_job.workspace_path,
+                        container_working_dir: db_job.container_working_dir,
+                        step_working_directories: db_job.step_working_directories,
                         timeout_secs: db_job.timeout_secs,
                         // The durable jobs table has no env column, so a
                         // scheduler-recovered job runs without pipeline
@@ -1699,8 +2096,8 @@ impl Scheduler {
                         volumes: Vec::new(),
                         lane: gitforge_common::Lane::Standard,
                         fault: None,
-                    },
-                );
+                    }
+                });
                 loaded += 1;
             }
         }
@@ -1917,6 +2314,74 @@ impl Scheduler {
         state.job_assignments.get(&job_id).copied()
     }
 
+    /// Return a matching, not-yet-started runner assignment to the queue.
+    /// The durable conditional update is the race arbiter against start_job;
+    /// the state write lock keeps this scheduler's queue and assignment mirror
+    /// consistent with the winning transition.
+    pub async fn defer_unstarted_assignment(
+        &self,
+        job_id: JobId,
+        runner_id: RunnerId,
+        lease_token: &str,
+    ) -> anyhow::Result<bool> {
+        let mut state = self.state.write().await;
+        let Some((assigned_runner, pipeline_run_id, repo_id)) =
+            state.assigned_jobs.get(&job_id).copied()
+        else {
+            return Ok(false);
+        };
+        if assigned_runner != runner_id
+            || state.job_leases.get(&job_id).map(String::as_str) != Some(lease_token)
+        {
+            return Ok(false);
+        }
+
+        if let Some(pool) = &self.db_pool {
+            let changed = gitforge_db::queries::JobQueries::defer_assigned_with_lease(
+                pool,
+                job_id,
+                runner_id,
+                lease_token,
+                DeferredReason::HostResourceAdmissionBusy.as_str(),
+            )
+            .await?;
+            if !changed {
+                return Ok(false);
+            }
+        }
+
+        state.job_assignments.remove(&job_id);
+        state.assigned_jobs.remove(&job_id);
+        state.job_leases.remove(&job_id);
+        state.queue.enqueue(crate::queue::QueuedJob::new(
+            job_id,
+            pipeline_run_id,
+            repo_id,
+        ));
+        state.deferred_reasons.insert(
+            job_id,
+            DeferredReason::HostResourceAdmissionBusy
+                .as_str()
+                .to_string(),
+        );
+        state
+            .storage_lease_blocked_runners
+            .insert(runner_id, Instant::now() + HOST_STORAGE_LEASE_RETRY_BACKOFF);
+        if let Some(metrics) = &self.metrics {
+            let lane = state
+                .job_definitions
+                .get(&job_id)
+                .map_or_default(|definition| definition.lane);
+            metrics.record_job_deferral(
+                lane.as_str(),
+                DeferredReason::HostResourceAdmissionBusy.as_str(),
+            );
+        }
+        drop(state);
+        self.dispatch_wake.notify_one();
+        Ok(true)
+    }
+
     /// Get all assigned jobs (jobs assigned to runners, awaiting execution)
     pub async fn get_assigned_jobs(&self) -> Vec<(JobId, RunnerId, PipelineRunId)> {
         let state = self.state.read().await;
@@ -1947,16 +2412,40 @@ impl Scheduler {
     /// Return the current lease for a job, creating one for an existing
     /// assignment when needed. Repeated calls are idempotent.
     pub async fn ensure_job_lease(&self, job_id: JobId) -> Option<String> {
-        let lease = {
-            let mut state = self.state.write().await;
+        let mirrored = {
+            let state = self.state.read().await;
             if !state.assigned_jobs.contains_key(&job_id) {
                 return None;
             }
-            state
-                .job_leases
-                .entry(job_id)
-                .or_insert_with(|| Uuid::new_v4().to_string())
-                .clone()
+            state.job_leases.get(&job_id).cloned()
+        };
+        let lease = match mirrored {
+            Some(lease) => lease,
+            None => {
+                // The mirror has no lease for a job it is assigned. The
+                // durable row may still carry the token the runner holds:
+                // adopting it keeps that lease valid, where minting a new
+                // one would rotate the token under the runner that is
+                // executing the job and every completion it sends would
+                // then be rejected (GF-12).
+                let adopted = match &self.db_pool {
+                    Some(pool) => gitforge_db::queries::JobQueries::get(pool, job_id)
+                        .await
+                        .ok()
+                        .flatten()
+                        .and_then(|job| job.lease_token),
+                    None => None,
+                };
+                let mut state = self.state.write().await;
+                if !state.assigned_jobs.contains_key(&job_id) {
+                    return None;
+                }
+                state
+                    .job_leases
+                    .entry(job_id)
+                    .or_insert_with(|| adopted.unwrap_or_else(|| Uuid::new_v4().to_string()))
+                    .clone()
+            }
         };
         // Keep the durable row in sync with the lease handed to the runner.
         // Lease validation reads the database, and a stale or missing row
@@ -2082,6 +2571,7 @@ impl Scheduler {
                         pipeline_run_id,
                         runner_id,
                         success: false,
+                        outcome: JobOutcome::Failed,
                     });
                 }
             }
@@ -2246,6 +2736,7 @@ impl Scheduler {
                 pipeline_run_id,
                 runner_id,
                 success: outcome.success(),
+                outcome: outcome,
             });
         }
         Ok(())
@@ -2374,6 +2865,9 @@ mod tests {
             runner_type: RunnerType::Docker.as_str().to_string(),
             status: status.to_string(),
             capacity,
+            storage_domain: "test-domain".to_string(),
+            paused: false,
+            pause_generation: 0,
             last_heartbeat: None,
             created_at: chrono::Utc::now(),
         }
@@ -2440,6 +2934,9 @@ mod tests {
             commands: vec!["cargo test --workspace".to_string()],
             image: "rust:1".to_string(),
             working_dir: None,
+            workspace_path: None,
+            container_working_dir: None,
+            step_working_directories: Vec::new(),
             timeout_secs: DEFAULT_JOB_TIMEOUT_SECS,
             env: HashMap::new(),
             volumes: Vec::new(),
@@ -2453,6 +2950,9 @@ mod tests {
             commands: vec!["echo plain".to_string()],
             image: "rust:1".to_string(),
             working_dir: None,
+            workspace_path: None,
+            container_working_dir: None,
+            step_working_directories: Vec::new(),
             timeout_secs: DEFAULT_JOB_TIMEOUT_SECS,
             env: HashMap::new(),
             volumes: Vec::new(),
@@ -2517,6 +3017,128 @@ mod tests {
         assert!(
             scheduler.is_assigned(blocked_job).await.is_none(),
             "exclusive-class job must stay queued while its class is running"
+        );
+    }
+
+    /// The DIL coverage job's command verbatim. It mentions "the test binary"
+    /// in a comment and runs `cargo llvm-cov --workspace` — the shape the
+    /// word scan misfiled into the workspace-cargo-test class (GF-14).
+    fn coverage_definition() -> JobExecutionDefinition {
+        JobExecutionDefinition {
+            commands: vec![
+                "command -v cargo-llvm-cov >/dev/null 2>&1 || { echo \"cargo-llvm-cov not in image; skipping\"; exit 0; }\nexport CARGO_BUILD_JOBS=4\n# This is the job that died on 2026-11-05 with ENOENT on the\n# test binary; the runner's mount lock is what keeps the tree\n# it executes from being replaced under it.\ncargo llvm-cov --workspace --summary-only --fail-under-lines 95".to_string(),
+            ],
+            image: "rust:1".to_string(),
+            working_dir: None,
+                workspace_path: None,
+                container_working_dir: None,
+                step_working_directories: Vec::new(),
+            timeout_secs: DEFAULT_JOB_TIMEOUT_SECS,
+            env: HashMap::new(),
+            volumes: Vec::new(),
+            lane: gitforge_common::Lane::Standard,
+            fault: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_coverage_build_is_exclusive_with_other_cargo_compilation() {
+        // `cargo llvm-cov` compiles instrumented artifacts. Serialize it with
+        // other Cargo compiler workloads to keep runner I/O bounded.
+        let scheduler = Scheduler::new();
+        let repo_id = RepoId::new();
+        let run_id = PipelineRunId::new();
+
+        let coverage_job = JobId::new();
+        scheduler
+            .enqueue_with_definition_and_image_and_timeout(
+                coverage_job,
+                run_id,
+                repo_id,
+                coverage_definition(),
+            )
+            .await
+            .unwrap();
+
+        let runner = make_runner(RunnerId::new(), "test-runner", "online", 2);
+        let runner_id = runner.id;
+        scheduler.register_runner(runner).await;
+
+        // One Cargo compile workload already in flight on that runner.
+        let running_test_job = JobId::new();
+        {
+            let mut state = scheduler.state.write().await;
+            state
+                .job_definitions
+                .insert(running_test_job, workspace_test_definition());
+            state
+                .assigned_jobs
+                .insert(running_test_job, (runner_id, run_id, repo_id));
+        }
+
+        scheduler.process_queue().await;
+
+        assert!(scheduler.is_assigned(coverage_job).await.is_none());
+        let status = scheduler.queue_status().await.unwrap();
+        let deferred = status
+            .queued
+            .iter()
+            .find(|job| job.job_id == coverage_job)
+            .expect("coverage job remains queued while compilation is active");
+        assert_eq!(
+            deferred.deferred_reason.as_deref(),
+            Some("resource_class_conflict")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_class_excluded_job_names_its_blocker() {
+        // GF-14: the exclusion is invisible unless it is named. A job held
+        // back by the exclusive resource class has to carry that reason, the
+        // same way a lane-limited job does.
+        let scheduler = Scheduler::new();
+        let repo_id = RepoId::new();
+        let run_id = PipelineRunId::new();
+
+        let blocked_job = JobId::new();
+        scheduler
+            .enqueue_with_definition_and_image_and_timeout(
+                blocked_job,
+                run_id,
+                repo_id,
+                workspace_test_definition(),
+            )
+            .await
+            .unwrap();
+
+        let runner = make_runner(RunnerId::new(), "test-runner", "online", 2);
+        let runner_id = runner.id;
+        scheduler.register_runner(runner).await;
+
+        let running_test_job = JobId::new();
+        {
+            let mut state = scheduler.state.write().await;
+            state
+                .job_definitions
+                .insert(running_test_job, workspace_test_definition());
+            state
+                .assigned_jobs
+                .insert(running_test_job, (runner_id, run_id, repo_id));
+        }
+
+        scheduler.process_queue().await;
+
+        assert!(scheduler.is_assigned(blocked_job).await.is_none());
+        let status = scheduler.queue_status().await.unwrap();
+        let deferred = status
+            .queued
+            .iter()
+            .find(|job| job.job_id == blocked_job)
+            .expect("the excluded job is still queued");
+        assert_eq!(
+            deferred.deferred_reason.as_deref(),
+            Some("resource_class_conflict"),
+            "the resource-class exclusion must name its blocker"
         );
     }
 
@@ -2601,6 +3223,9 @@ mod tests {
                     commands: vec!["echo image".to_string()],
                     image: "node:22".to_string(),
                     working_dir: Some("/workspace".to_string()),
+                    workspace_path: None,
+                    container_working_dir: None,
+                    step_working_directories: Vec::new(),
                     timeout_secs: 900,
                     env: HashMap::new(),
                     volumes: Vec::new(),
@@ -2668,6 +3293,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn durable_runner_pause_reconciles_scheduler_assignment_mirror() {
+        let pool = gitforge_db::Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+        let (run_id, repo_id) = seed_durable_run(&pool).await;
+        let scheduler = Scheduler::with_db(pool.clone());
+        let runner = Runner::new("pause-mirror-runner".to_string(), RunnerType::Docker, 1);
+        let runner_id = scheduler.register_runner(runner).await.id;
+        let job_id = JobId::new();
+        let definition = JobExecutionDefinition {
+            commands: vec!["echo bounded".to_string()],
+            image: "alpine:3".to_string(),
+            working_dir: None,
+            workspace_path: None,
+            container_working_dir: None,
+            step_working_directories: Vec::new(),
+            timeout_secs: 30,
+            env: HashMap::new(),
+            volumes: Vec::new(),
+            lane: Lane::Standard,
+            fault: None,
+        };
+        scheduler
+            .enqueue_with_definition_and_image_and_timeout(job_id, run_id, repo_id, definition)
+            .await
+            .unwrap();
+
+        scheduler
+            .process_queue_with_io_pressure(HostIoPressure::from_text("", 0.0))
+            .await;
+        assert_eq!(scheduler.is_assigned(job_id).await, Some(runner_id));
+
+        assert_eq!(
+            gitforge_db::queries::RunnerQueries::set_paused(&pool, runner_id, true)
+                .await
+                .unwrap(),
+            Some((1, 0))
+        );
+        scheduler
+            .process_queue_with_io_pressure(HostIoPressure::from_text("", 0.0))
+            .await;
+
+        assert_eq!(scheduler.is_assigned(job_id).await, None);
+        let queued = gitforge_db::queries::JobQueries::get(&pool, job_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(queued.status, "queued");
+        assert_eq!(queued.runner_id, None);
+        {
+            let state = scheduler.state.read().await;
+            let restored = state.job_definitions.get(&job_id).unwrap();
+            assert_eq!(restored.image, "alpine:3");
+            assert_eq!(restored.commands, ["echo bounded"]);
+        }
+
+        gitforge_db::queries::RunnerQueries::set_paused(&pool, runner_id, false)
+            .await
+            .unwrap();
+        scheduler
+            .process_queue_with_io_pressure(HostIoPressure::from_text("", 0.0))
+            .await;
+        assert_eq!(scheduler.is_assigned(job_id).await, Some(runner_id));
+    }
+
+    #[tokio::test]
     async fn test_api_cancelled_assigned_job_is_not_reassigned() {
         let pool = gitforge_db::Pool::memory().await.unwrap();
         pool.migrate().await.unwrap();
@@ -2728,6 +3418,7 @@ mod tests {
                 created_at: chrono::Utc::now(),
                 error: None,
                 ref_name: None,
+                push_base_sha: None,
             },
         )
         .await
@@ -2982,6 +3673,7 @@ mod tests {
                 pipeline_run_id: completed_run,
                 runner_id: completed_runner,
                 success: false,
+                outcome: JobOutcome::Failed,
             } if completed_job == job_id && completed_run == run.id && completed_runner == runner_id
         ));
 
@@ -3227,6 +3919,7 @@ mod tests {
                 pipeline_run_id: completed_run,
                 runner_id: completed_runner,
                 success: false,
+                outcome: JobOutcome::Failed,
             } if completed == job_id && completed_run == run_id && completed_runner == runner_id
         ));
     }
@@ -3540,7 +4233,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_workspace_cargo_tests_are_admitted_exclusively_per_runner() {
+    async fn test_cargo_compilation_is_admitted_exclusively_per_runner() {
         let scheduler = Scheduler::new();
         let runner = make_runner(RunnerId::new(), "fedora-runner", "online", 4);
         let runner_id = runner.id;
@@ -3550,13 +4243,16 @@ mod tests {
         let second_job = JobId::new();
         let run_id = PipelineRunId::new();
         let repo_id = RepoId::new();
-        for job_id in [first_job, second_job] {
+        for (job_id, command) in [
+            (first_job, "cargo test --workspace"),
+            (second_job, "cargo build --target wasm32-unknown-unknown"),
+        ] {
             scheduler
                 .enqueue_with_definition(
                     job_id,
                     run_id,
                     repo_id,
-                    vec!["cargo test --workspace".to_string()],
+                    vec![command.to_string()],
                     Some("/workspace".to_string()),
                 )
                 .await
@@ -3583,6 +4279,477 @@ mod tests {
         scheduler.process_queue().await;
 
         assert_eq!(scheduler.is_assigned(second_job).await, Some(runner_id));
+    }
+
+    #[tokio::test]
+    async fn host_io_pressure_defers_compile_and_heavy_jobs_but_keeps_standard_work_moving() {
+        let scheduler = Scheduler::new();
+        let runner = make_runner(RunnerId::new(), "swarmone-runner", "online", 4);
+        let runner_id = runner.id;
+        scheduler.register_runner(runner).await;
+
+        let cargo_job = JobId::new();
+        let heavy_job = JobId::new();
+        let standard_job = JobId::new();
+        let run_id = PipelineRunId::new();
+        let repo_id = RepoId::new();
+        scheduler
+            .enqueue_with_definition(
+                cargo_job,
+                run_id,
+                repo_id,
+                vec!["cargo test --workspace".to_string()],
+                Some("/workspace".to_string()),
+            )
+            .await
+            .unwrap();
+        scheduler
+            .enqueue_with_definition_and_image_and_timeout(
+                heavy_job,
+                run_id,
+                repo_id,
+                JobExecutionDefinition {
+                    commands: vec!["./scripts/full-release-check.sh".to_string()],
+                    image: "rust:latest".to_string(),
+                    working_dir: Some("/workspace".to_string()),
+                    workspace_path: None,
+                    container_working_dir: None,
+                    step_working_directories: Vec::new(),
+                    timeout_secs: DEFAULT_JOB_TIMEOUT_SECS,
+                    env: HashMap::new(),
+                    volumes: Vec::new(),
+                    lane: Lane::Heavy,
+                    fault: None,
+                },
+            )
+            .await
+            .unwrap();
+        scheduler
+            .enqueue_with_definition(
+                standard_job,
+                run_id,
+                repo_id,
+                vec!["echo metadata-only".to_string()],
+                Some("/workspace".to_string()),
+            )
+            .await
+            .unwrap();
+
+        let pressure = HostIoPressure::from_text(
+            "some avg10=95 avg60=90 avg300=80 total=1\nfull avg10=75.0 avg60=70 avg300=60 total=2\n",
+            25.0,
+        );
+        scheduler.process_queue_with_io_pressure(pressure).await;
+
+        assert!(scheduler.is_assigned(cargo_job).await.is_none());
+        assert!(scheduler.is_assigned(heavy_job).await.is_none());
+        assert_eq!(scheduler.is_assigned(standard_job).await, Some(runner_id));
+        assert_eq!(scheduler.queue_len().await, 2);
+        let state = scheduler.state.read().await;
+        assert_eq!(
+            state.deferred_reasons.get(&cargo_job).map(String::as_str),
+            Some("host_io_pressure")
+        );
+        assert_eq!(
+            state.deferred_reasons.get(&heavy_job).map(String::as_str),
+            Some("host_io_pressure")
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_host_io_pressure_fails_closed_for_cargo_work() {
+        let scheduler = Scheduler::new();
+        scheduler
+            .register_runner(make_runner(RunnerId::new(), "swarmone-runner", "online", 1))
+            .await;
+        let job_id = JobId::new();
+        scheduler
+            .enqueue_with_definition(
+                job_id,
+                PipelineRunId::new(),
+                RepoId::new(),
+                vec!["cargo check --workspace".to_string()],
+                Some("/workspace".to_string()),
+            )
+            .await
+            .unwrap();
+
+        scheduler
+            .process_queue_with_io_pressure(HostIoPressure::from_text("", 25.0))
+            .await;
+
+        assert!(scheduler.is_assigned(job_id).await.is_none());
+        let state = scheduler.state.read().await;
+        assert_eq!(
+            state.deferred_reasons.get(&job_id).map(String::as_str),
+            Some("host_io_pressure_unavailable")
+        );
+    }
+
+    #[tokio::test]
+    async fn high_host_cpu_pressure_defers_cargo_with_a_durable_reason() {
+        let scheduler = Scheduler::new();
+        scheduler
+            .register_runner(make_runner(RunnerId::new(), "swarmone-runner", "online", 1))
+            .await;
+        let job_id = JobId::new();
+        scheduler
+            .enqueue_with_definition(
+                job_id,
+                PipelineRunId::new(),
+                RepoId::new(),
+                vec!["cargo check --workspace".to_string()],
+                Some("/workspace".to_string()),
+            )
+            .await
+            .unwrap();
+
+        let pressure = HostIoPressure::from_text(
+            "some avg10=1 avg60=1 avg300=1 total=1\nfull avg10=1 avg60=1 avg300=1 total=2\n",
+            25.0,
+        )
+        .with_cpu_some_avg10_pct(Some(80.1))
+        .with_active_build_pids(Some(Vec::new()));
+        scheduler.process_queue_with_io_pressure(pressure).await;
+
+        assert!(scheduler.is_assigned(job_id).await.is_none());
+        let state = scheduler.state.read().await;
+        assert_eq!(
+            state.deferred_reasons.get(&job_id).map(String::as_str),
+            Some("host_cpu_pressure")
+        );
+    }
+
+    #[tokio::test]
+    async fn active_host_builds_defer_cargo_even_when_psi_is_low() {
+        let scheduler = Scheduler::new();
+        scheduler
+            .register_runner(make_runner(RunnerId::new(), "swarmone-runner", "online", 2))
+            .await;
+        let job_id = JobId::new();
+        scheduler
+            .enqueue_with_definition(
+                job_id,
+                PipelineRunId::new(),
+                RepoId::new(),
+                vec!["cargo check --workspace".to_string()],
+                Some("/workspace".to_string()),
+            )
+            .await
+            .unwrap();
+
+        let pressure = HostIoPressure::from_text(
+            "some avg10=10 avg60=10 avg300=10 total=1\nfull avg10=1.0 avg60=1 avg300=1 total=2\n",
+            25.0,
+        )
+        .with_active_build_pids(Some(vec![1234]));
+        scheduler.process_queue_with_io_pressure(pressure).await;
+
+        assert!(scheduler.is_assigned(job_id).await.is_none());
+        let state = scheduler.state.read().await;
+        assert_eq!(
+            state.deferred_reasons.get(&job_id).map(String::as_str),
+            Some("host_build_active")
+        );
+    }
+
+    #[tokio::test]
+    async fn cargo_work_resumes_when_host_io_pressure_is_below_the_limit() {
+        let scheduler = Scheduler::new();
+        let runner = make_runner(RunnerId::new(), "swarmone-runner", "online", 1);
+        let runner_id = runner.id;
+        scheduler.register_runner(runner).await;
+        let job_id = JobId::new();
+        scheduler
+            .enqueue_with_definition(
+                job_id,
+                PipelineRunId::new(),
+                RepoId::new(),
+                vec!["cargo check --workspace".to_string()],
+                Some("/workspace".to_string()),
+            )
+            .await
+            .unwrap();
+
+        scheduler
+            .process_queue_with_io_pressure(HostIoPressure::from_text(
+                "some avg10=20 avg60=10 avg300=5 total=1\nfull avg10=10.0 avg60=5 avg300=2 total=2\n",
+                25.0,
+            ))
+            .await;
+
+        assert_eq!(scheduler.is_assigned(job_id).await, Some(runner_id));
+    }
+
+    #[tokio::test]
+    async fn host_storage_slot_serializes_cargo_jobs_within_one_storage_domain() {
+        let scheduler = Scheduler::new();
+        scheduler
+            .register_runner(make_runner(RunnerId::new(), "runner-a", "online", 1))
+            .await;
+        scheduler
+            .register_runner(make_runner(RunnerId::new(), "runner-b", "online", 1))
+            .await;
+
+        let first_job = JobId::new();
+        let second_job = JobId::new();
+        for (job_id, repo_id) in [(first_job, RepoId::new()), (second_job, RepoId::new())] {
+            scheduler
+                .enqueue_with_definition(
+                    job_id,
+                    PipelineRunId::new(),
+                    repo_id,
+                    vec!["cargo test --workspace".to_string()],
+                    Some("/workspace".to_string()),
+                )
+                .await
+                .unwrap();
+        }
+
+        let low_pressure = || {
+            HostIoPressure::from_text(
+                "some avg10=1 avg60=1 avg300=1 total=1\nfull avg10=1.0 avg60=1 avg300=1 total=2\n",
+                25.0,
+            )
+        };
+        scheduler
+            .process_queue_with_io_pressure(low_pressure())
+            .await;
+
+        let (assigned_job, assigned_runner, waiting_job) = match (
+            scheduler.is_assigned(first_job).await,
+            scheduler.is_assigned(second_job).await,
+        ) {
+            (Some(runner), None) => (first_job, runner, second_job),
+            (None, Some(runner)) => (second_job, runner, first_job),
+            assignment => panic!("expected exactly one assigned Cargo job, got {assignment:?}"),
+        };
+        assert_eq!(scheduler.queue_len().await, 1);
+        assert_eq!(
+            scheduler
+                .state
+                .read()
+                .await
+                .deferred_reasons
+                .get(&waiting_job)
+                .map(String::as_str),
+            Some("host_storage_slot_busy")
+        );
+
+        let lease = scheduler.ensure_job_lease(assigned_job).await.unwrap();
+        scheduler
+            .complete_job_with_lease(
+                assigned_job,
+                assigned_runner,
+                &lease,
+                JobOutcome::Succeeded,
+                "{\"success\":true}".to_string(),
+            )
+            .await
+            .unwrap();
+        scheduler
+            .process_queue_with_io_pressure(low_pressure())
+            .await;
+
+        assert!(scheduler.is_assigned(waiting_job).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn unknown_domain_for_readopted_cargo_job_blocks_storage_admission() {
+        let scheduler = Scheduler::new();
+        let orphaned_runner_id = RunnerId::new();
+        let active_job_id = JobId::new();
+        let active_run_id = PipelineRunId::new();
+        let active_repo_id = RepoId::new();
+        scheduler
+            .enqueue_with_definition(
+                active_job_id,
+                active_run_id,
+                active_repo_id,
+                vec!["cargo test --workspace".to_string()],
+                Some("/workspace/active".to_string()),
+            )
+            .await
+            .unwrap();
+
+        // Model restart recovery after the active job has been re-adopted,
+        // while its runner has not yet re-registered and published a domain.
+        {
+            let mut state = scheduler.state.write().await;
+            assert!(state.queue.remove(active_job_id).is_some());
+            state
+                .job_assignments
+                .insert(active_job_id, orphaned_runner_id);
+            state.assigned_jobs.insert(
+                active_job_id,
+                (orphaned_runner_id, active_run_id, active_repo_id),
+            );
+        }
+
+        let available_runner = make_runner(RunnerId::new(), "available-runner", "online", 1);
+        scheduler.register_runner(available_runner).await;
+        let queued_job_id = JobId::new();
+        scheduler
+            .enqueue_with_definition(
+                queued_job_id,
+                PipelineRunId::new(),
+                RepoId::new(),
+                vec!["cargo check --workspace".to_string()],
+                Some("/workspace/queued".to_string()),
+            )
+            .await
+            .unwrap();
+
+        let low_pressure = HostIoPressure::from_text(
+            "some avg10=1 avg60=1 avg300=1 total=1\nfull avg10=1.0 avg60=1 avg300=1 total=2\n",
+            25.0,
+        );
+        scheduler.process_queue_with_io_pressure(low_pressure).await;
+
+        assert!(scheduler.is_assigned(queued_job_id).await.is_none());
+        assert_eq!(scheduler.queue_len().await, 1);
+        assert_eq!(
+            scheduler
+                .state
+                .read()
+                .await
+                .deferred_reasons
+                .get(&queued_job_id)
+                .map(String::as_str),
+            Some("host_storage_slot_busy")
+        );
+    }
+
+    #[tokio::test]
+    async fn independent_storage_domains_can_run_cargo_jobs_in_parallel() {
+        let scheduler = Scheduler::new();
+        let mut fedora = make_runner(RunnerId::new(), "fedora", "online", 1);
+        fedora.storage_domain = "fedora-local-nvme".to_string();
+        let mut t5500 = make_runner(RunnerId::new(), "t5500", "online", 1);
+        t5500.storage_domain = "t5500-local-nvme".to_string();
+        scheduler.register_runner(fedora).await;
+        scheduler.register_runner(t5500).await;
+
+        let run_id = PipelineRunId::new();
+        let first_job = JobId::new();
+        let second_job = JobId::new();
+        for job_id in [first_job, second_job] {
+            scheduler
+                .enqueue_with_definition(
+                    job_id,
+                    run_id,
+                    RepoId::new(),
+                    vec!["cargo check --workspace".to_string()],
+                    Some("/workspace".to_string()),
+                )
+                .await
+                .unwrap();
+        }
+
+        let low_pressure = HostIoPressure::from_text(
+            "some avg10=1 avg60=1 avg300=1 total=1\nfull avg10=1 avg60=1 avg300=1 total=2\n",
+            25.0,
+        );
+        scheduler.process_queue_with_io_pressure(low_pressure).await;
+
+        assert!(scheduler.is_assigned(first_job).await.is_some());
+        assert!(scheduler.is_assigned(second_job).await.is_some());
+        assert_eq!(scheduler.queue_len().await, 0);
+        let assignments = scheduler.get_assigned_jobs().await;
+        let state = scheduler.state.read().await;
+        let domains: std::collections::HashSet<_> = assignments
+            .iter()
+            .filter_map(|(_, runner_id, _)| state.runners.get(runner_id))
+            .map(|runner| runner.storage_domain.clone())
+            .collect();
+        assert_eq!(domains.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn host_pressure_only_defers_the_matching_storage_domain() {
+        let scheduler = Scheduler::new();
+        let local = make_runner(RunnerId::new(), "local", "online", 1);
+        let mut remote = make_runner(RunnerId::new(), "remote", "online", 1);
+        remote.storage_domain = "remote-nvme".to_string();
+        scheduler.register_runner(local).await;
+        scheduler.register_runner(remote).await;
+
+        let job_id = JobId::new();
+        scheduler
+            .enqueue_with_definition(
+                job_id,
+                PipelineRunId::new(),
+                RepoId::new(),
+                vec!["cargo check --workspace".to_string()],
+                Some("/workspace".to_string()),
+            )
+            .await
+            .unwrap();
+        let pressure = HostIoPressure::from_text(
+            "some avg10=90 avg60=80 avg300=70 total=1\nfull avg10=60 avg60=50 avg300=40 total=2\n",
+            25.0,
+        );
+        scheduler.process_queue_with_io_pressure(pressure).await;
+
+        let assigned_runner = scheduler.is_assigned(job_id).await.unwrap();
+        assert_eq!(
+            scheduler.state.read().await.runners[&assigned_runner].storage_domain,
+            "remote-nvme"
+        );
+    }
+
+    #[tokio::test]
+    async fn busy_runner_host_lease_requeues_assignment_and_preserves_reason() {
+        let scheduler = Scheduler::new();
+        let runner = make_runner(RunnerId::new(), "runner-a", "online", 1);
+        let runner_id = runner.id;
+        scheduler.register_runner(runner).await;
+        let job_id = JobId::new();
+        scheduler
+            .enqueue_with_definition(
+                job_id,
+                PipelineRunId::new(),
+                RepoId::new(),
+                vec!["cargo test --workspace".to_string()],
+                Some("/workspace".to_string()),
+            )
+            .await
+            .unwrap();
+        let low_pressure = HostIoPressure::from_text(
+            "some avg10=1 avg60=1 avg300=1 total=1\nfull avg10=1 avg60=1 avg300=1 total=2\n",
+            25.0,
+        );
+        scheduler.process_queue_with_io_pressure(low_pressure).await;
+        assert_eq!(scheduler.is_assigned(job_id).await, Some(runner_id));
+        let lease = scheduler.ensure_job_lease(job_id).await.unwrap();
+
+        assert!(scheduler
+            .defer_unstarted_assignment(job_id, runner_id, &lease)
+            .await
+            .unwrap());
+        assert!(scheduler.is_assigned(job_id).await.is_none());
+        assert_eq!(scheduler.queue_len().await, 1);
+        assert_eq!(
+            scheduler
+                .state
+                .read()
+                .await
+                .deferred_reasons
+                .get(&job_id)
+                .map(String::as_str),
+            Some("host_resource_admission_busy")
+        );
+        assert!(!scheduler
+            .defer_unstarted_assignment(job_id, runner_id, &lease)
+            .await
+            .unwrap());
+        let low_pressure = HostIoPressure::from_text(
+            "some avg10=1 avg60=1 avg300=1 total=1\nfull avg10=1 avg60=1 avg300=1 total=2\n",
+            25.0,
+        );
+        scheduler.process_queue_with_io_pressure(low_pressure).await;
+        assert!(scheduler.is_assigned(job_id).await.is_none());
+        assert_eq!(scheduler.queue_len().await, 1);
     }
 
     #[tokio::test]
@@ -4210,6 +5377,9 @@ mod tests {
             commands: vec!["echo lane".to_string()],
             image: "rust:1".to_string(),
             working_dir: None,
+            workspace_path: None,
+            container_working_dir: None,
+            step_working_directories: Vec::new(),
             timeout_secs: DEFAULT_JOB_TIMEOUT_SECS,
             env: HashMap::new(),
             volumes: Vec::new(),
@@ -4244,7 +5414,7 @@ mod tests {
     async fn test_lane_limit_defers_with_durable_reason_and_no_head_of_line_block() {
         let scheduler = Scheduler::new().with_lane_limits({
             let mut limits = unbounded_lanes();
-            limits.insert(Lane::Heavy, Some(1));
+            limits.insert(Lane::Standard, Some(1));
             limits
         });
         let runner = make_runner(RunnerId::new(), "runner1", "online", 4);
@@ -4252,52 +5422,52 @@ mod tests {
         let run_id = PipelineRunId::new();
         let repo_id = RepoId::new();
 
-        let first_heavy = JobId::new();
+        let first_standard = JobId::new();
         scheduler
             .enqueue_with_definition_and_image_and_timeout(
-                first_heavy,
-                run_id,
-                repo_id,
-                lane_definition(Lane::Heavy),
-            )
-            .await
-            .unwrap();
-        let second_heavy = JobId::new();
-        scheduler
-            .enqueue_with_definition_and_image_and_timeout(
-                second_heavy,
-                run_id,
-                repo_id,
-                lane_definition(Lane::Heavy),
-            )
-            .await
-            .unwrap();
-        // A standard job queued BEHIND two heavy jobs: the deferred head
-        // must not block it.
-        let plain = JobId::new();
-        scheduler
-            .enqueue_with_definition_and_image_and_timeout(
-                plain,
+                first_standard,
                 run_id,
                 repo_id,
                 lane_definition(Lane::Standard),
             )
             .await
             .unwrap();
+        let second_standard = JobId::new();
+        scheduler
+            .enqueue_with_definition_and_image_and_timeout(
+                second_standard,
+                run_id,
+                repo_id,
+                lane_definition(Lane::Standard),
+            )
+            .await
+            .unwrap();
+        // A fast job queued BEHIND two standard jobs: the deferred head
+        // must not block it.
+        let fast = JobId::new();
+        scheduler
+            .enqueue_with_definition_and_image_and_timeout(
+                fast,
+                run_id,
+                repo_id,
+                lane_definition(Lane::Fast),
+            )
+            .await
+            .unwrap();
 
         scheduler.process_queue().await;
 
-        assert!(scheduler.is_assigned(first_heavy).await.is_some());
-        assert!(scheduler.is_assigned(second_heavy).await.is_none());
-        assert!(scheduler.is_assigned(plain).await.is_some());
+        assert!(scheduler.is_assigned(first_standard).await.is_some());
+        assert!(scheduler.is_assigned(second_standard).await.is_none());
+        assert!(scheduler.is_assigned(fast).await.is_some());
 
         let status = scheduler.queue_status().await.unwrap();
         let deferred = status
             .queued
             .iter()
-            .find(|job| job.job_id == second_heavy)
-            .expect("deferred heavy job is still queued");
-        assert_eq!(deferred.lane, "heavy");
+            .find(|job| job.job_id == second_standard)
+            .expect("deferred standard job is still queued");
+        assert_eq!(deferred.lane, "standard");
         assert_eq!(
             deferred.deferred_reason.as_deref(),
             Some("lane_limit"),
@@ -4431,5 +5601,187 @@ mod tests {
         );
         let status = scheduler.queue_status().await.unwrap();
         assert!(status.queued.iter().all(|job| job.job_id != second));
+    }
+
+    /// GF-12: a duplicate enqueue must not break the lease of a job that
+    /// is already running.
+    ///
+    /// The CI service re-enqueues every job its engine still holds as
+    /// `Queued`, and the engine's mirror stayed `Queued` for a dispatched
+    /// job (nothing consumed the scheduler's `JobAssigned` event). The
+    /// duplicate enqueue demoted the live job's durable row to `queued`
+    /// with an unguarded UPDATE: the runner's heartbeat was refused, the
+    /// row became dispatchable again, the lease token was rotated under
+    /// the runner that was executing the job, and every completion it sent
+    /// was rejected - three executions of the job, then a
+    /// `runner_lost_while_running` fence.
+    ///
+    /// The contract pinned here is the runner's: while the job runs, the
+    /// duplicate enqueue leaves the row, the lease and the heartbeat
+    /// alone, and the completion lands.
+    #[tokio::test]
+    async fn a_duplicate_enqueue_does_not_break_a_running_jobs_lease() {
+        let pool = gitforge_db::Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+        let (run_id, repo_id) = seed_durable_run(&pool).await;
+        let scheduler = Scheduler::with_db(pool.clone());
+        let job_id = JobId::new();
+        // The durable row's runner is a foreign key: the runner has to
+        // exist before the job can be leased to it.
+        let runner =
+            gitforge_db::models::Runner::new("gf12-runner".to_string(), RunnerType::Docker, 1);
+        gitforge_db::queries::RunnerQueries::create(&pool, &runner)
+            .await
+            .unwrap();
+        let runner_id = runner.id;
+        let lease = "lease-token-of-the-running-job";
+        let definition = JobExecutionDefinition {
+            commands: vec!["cargo test".to_string()],
+            image: "backend-ci-rust:1".to_string(),
+            working_dir: Some("/workspace".to_string()),
+            workspace_path: None,
+            container_working_dir: None,
+            step_working_directories: Vec::new(),
+            timeout_secs: 900,
+            env: HashMap::new(),
+            volumes: Vec::new(),
+            lane: gitforge_common::Lane::Standard,
+            fault: None,
+        };
+
+        scheduler
+            .enqueue_with_definition_and_image_and_timeout(
+                job_id,
+                run_id,
+                repo_id,
+                definition.clone(),
+            )
+            .await
+            .unwrap();
+
+        // The runner claims the job and starts it.
+        assert!(
+            gitforge_db::queries::JobQueries::assign_with_lease(&pool, job_id, runner_id, lease)
+                .await
+                .unwrap(),
+            "the runner claims the queued job"
+        );
+        assert!(
+            gitforge_db::queries::JobQueries::start_with_lease(&pool, job_id, runner_id, lease)
+                .await
+                .unwrap(),
+            "the runner starts the claimed job"
+        );
+
+        // The duplicate enqueue the CI service issues when another job of
+        // the same run completes.
+        scheduler
+            .enqueue_with_definition_and_image_and_timeout(job_id, run_id, repo_id, definition)
+            .await
+            .unwrap();
+
+        let row = gitforge_db::queries::JobQueries::get(&pool, job_id)
+            .await
+            .unwrap()
+            .expect("the job row");
+        assert_eq!(
+            row.status, "running",
+            "the live job's row must not be demoted by a duplicate enqueue"
+        );
+        assert_eq!(
+            row.lease_token.as_deref(),
+            Some(lease),
+            "the lease must not rotate under the running runner"
+        );
+
+        // The runner's heartbeat is accepted and its completion lands.
+        assert!(
+            gitforge_db::queries::JobQueries::heartbeat(&pool, job_id, runner_id, lease)
+                .await
+                .unwrap(),
+            "the running job's heartbeat must still be accepted"
+        );
+        assert!(
+            gitforge_db::queries::JobQueries::complete_with_lease(
+                &pool,
+                job_id,
+                runner_id,
+                lease,
+                "succeeded",
+                "{}",
+            )
+            .await
+            .unwrap(),
+            "the running job's completion must land"
+        );
+    }
+
+    /// GF-12: the lease handed to a runner is the durable row's token.
+    ///
+    /// The mirror dropped its lease when an assignment was refused, and
+    /// the next lease for that job was minted fresh - which rotated the
+    /// token the runner was holding and made every completion it sent
+    /// fail the lease check. The durable token is the lease: it is adopted
+    /// instead of replaced.
+    #[tokio::test]
+    async fn the_lease_handed_to_a_runner_is_the_durable_token() {
+        let pool = gitforge_db::Pool::memory().await.unwrap();
+        pool.migrate().await.unwrap();
+        let (run_id, repo_id) = seed_durable_run(&pool).await;
+        let scheduler = Scheduler::with_db(pool.clone());
+        let job_id = JobId::new();
+        let runner = gitforge_db::models::Runner::new(
+            "gf12-adopting-runner".to_string(),
+            RunnerType::Docker,
+            1,
+        );
+        gitforge_db::queries::RunnerQueries::create(&pool, &runner)
+            .await
+            .unwrap();
+        let runner_id = runner.id;
+        let lease = "durable-lease-token";
+
+        scheduler
+            .enqueue_with_definition_and_image_and_timeout(
+                job_id,
+                run_id,
+                repo_id,
+                JobExecutionDefinition {
+                    commands: vec!["cargo test".to_string()],
+                    image: "backend-ci-rust:1".to_string(),
+                    working_dir: Some("/workspace".to_string()),
+                    workspace_path: None,
+                    container_working_dir: None,
+                    step_working_directories: Vec::new(),
+                    timeout_secs: 900,
+                    env: HashMap::new(),
+                    volumes: Vec::new(),
+                    lane: gitforge_common::Lane::Standard,
+                    fault: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(gitforge_db::queries::JobQueries::assign_with_lease(
+            &pool, job_id, runner_id, lease
+        )
+        .await
+        .unwrap());
+
+        // The scheduler mirrors the assignment, then loses its lease (the
+        // state a refused assignment produced).
+        {
+            let mut state = scheduler.state.write().await;
+            state
+                .assigned_jobs
+                .insert(job_id, (runner_id, run_id, repo_id));
+            state.job_leases.remove(&job_id);
+        }
+
+        let handed_out = scheduler.ensure_job_lease(job_id).await.unwrap();
+        assert_eq!(
+            handed_out, lease,
+            "the runner must be handed the token the durable row carries"
+        );
     }
 }

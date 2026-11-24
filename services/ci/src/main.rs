@@ -168,6 +168,16 @@ impl TriggerFailure {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // The release chain asks a binary for the commit it was built from
+    // (scripts/gitforge-release-stamps). Answer before any other work so
+    // that asking for provenance never starts a service, opens a database
+    // or binds a port.
+    if let Some(line) =
+        gitforge_common::build::version_line_if_requested("ci", std::env::args().skip(1))
+    {
+        println!("{line}");
+        return Ok(());
+    }
     // Initialize logging
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -363,15 +373,15 @@ async fn main() -> anyhow::Result<()> {
         // reconciliation spawn on purpose: a rebuilt engine can re-release
         // ready stages, and a run it still owns is protected from grading by
         // its unfinished durable rows rather than by registry custody.
-        let rebuilt = rebuild_live_engines(
+        let redriven = reconcile_live_engines(
             pool,
             &scheduler_arc,
             &pipeline_registry,
             &run_workspace_paths,
         )
         .await;
-        if rebuilt > 0 {
-            tracing::info!(rebuilt, "startup engine rebuild complete");
+        if redriven > 0 {
+            tracing::info!(redriven, "startup engine reconciliation complete");
         }
 
         // The startup rebuild is one-shot: a rebuild that failed (transient
@@ -392,15 +402,15 @@ async fn main() -> anyhow::Result<()> {
                 ticker.tick().await;
                 loop {
                     ticker.tick().await;
-                    let rebuilt = rebuild_live_engines(
+                    let redriven = reconcile_live_engines(
                         &redrive_pool,
                         &redrive_scheduler,
                         &redrive_registry,
                         &redrive_workspaces,
                     )
                     .await;
-                    if rebuilt > 0 {
-                        tracing::warn!(rebuilt, "periodic engine redrive recovered stalled runs");
+                    if redriven > 0 {
+                        tracing::info!(redriven, "periodic engine redrive reconciled stalled runs");
                     }
                 }
             });
@@ -416,6 +426,12 @@ async fn main() -> anyhow::Result<()> {
             let removed = sweep_terminal_workspaces(&sweep_pool).await;
             if removed > 0 {
                 tracing::info!(removed, "startup workspace sweep complete");
+            }
+            // Clean stale object caches for repositories that no longer exist.
+            // Scans _objects/<repo_id>/ for dirs whose repo_id is not in the
+            // active DB and removes them. Runs at startup and every 24h.
+            if let Err(e) = cleanup_stale_object_caches(&workspace_root()).await {
+                tracing::warn!(error = %e, "object cache cleanup deferred");
             }
             // Artifact retention (Phase 5.2): delete artifacts older than
             // GITFORGE_ARTIFACT_RETENTION_DAYS (default 30). Read at the
@@ -640,7 +656,12 @@ async fn main() -> anyhow::Result<()> {
                     let live_run_ids: Vec<gitforge_common::PipelineRunId> =
                         watchdog_registry.read().await.keys().copied().collect();
                     for run_id in live_run_ids {
-                        let engine = watchdog_registry.read().await.get(&run_id).cloned();
+                        // Reconciliation may replace an engine between
+                        // lookup and timeout propagation. Keep the registry
+                        // read guard until the mirror has consumed the
+                        // durable timeout evidence.
+                        let registry = watchdog_registry.read().await;
+                        let engine = registry.get(&run_id).cloned();
                         let Some(engine) = engine else { continue };
                         let jobs = match gitforge_db::queries::JobQueries::list_by_run(pool, run_id)
                             .await
@@ -670,6 +691,7 @@ async fn main() -> anyhow::Result<()> {
                                 }
                             }
                         }
+                        drop(registry);
                         finalize_run_if_terminal(
                             &engine,
                             Some(pool),
@@ -2014,23 +2036,57 @@ async fn prepare_run_workspace(
         return Ok(workspace.to_string_lossy().into_owned());
     }
 
-    // Do not request Git's hard-link-based local clone optimization here.
-    // Workspace and repository storage may be mounted with policies that
-    // reject hard links; a regular clone is portable across those filesystems.
+    // Clone from a persistent per-repo object cache on the workspace volume
+    // instead of the bare repository: the cache lives on the same filesystem
+    // as the workspaces, so the clone is a local pack copy, and the cache is
+    // refreshed incrementally (a fetch of the delta, not a full re-transfer).
+    // A missing or corrupt cache falls back to cloning straight from the
+    // bare repository and then seeds the cache from the fresh workspace.
+    let cache = object_cache_path(repo_id);
+    let cache_ready = refresh_object_cache(&cache, &source, run_id).await;
+    let (clone_source, seed_cache) = match cache_ready {
+        Ok(()) => (cache.clone(), false),
+        Err(error) => {
+            tracing::warn!(
+                run = %run_id,
+                repo = %repo_id,
+                error = %error,
+                "object cache unavailable; cloning from the bare repository"
+            );
+            (source.clone(), true)
+        }
+    };
+
     let mut clone = tokio::process::Command::new("git");
-    // --no-local: avoid hard links and local-object alternates for
-    // portability across protected or differently-owned storage.
     clone
-        .args(["clone", "--no-local", "--no-checkout"])
-        .arg(&source)
+        .args(["clone", "--local", "--no-checkout"])
+        .arg(&clone_source)
         .arg(&workspace);
     let clone = run_git_output(clone, "clone", workspace_prep_timeout()).await?;
     if !clone.status.success() {
-        return Err(anyhow::anyhow!(
-            "checkout clone failed for run {}: {}",
-            run_id,
-            String::from_utf8_lossy(&clone.stderr).trim()
-        ));
+        // `--local` requires the source to be a local path and to permit
+        // hard links or copies; if the cached clone was refused, retry the
+        // portable plain clone from the bare repository before failing.
+        let mut fallback = tokio::process::Command::new("git");
+        fallback
+            .args(["clone", "--no-local", "--no-checkout"])
+            .arg(&source)
+            .arg(&workspace);
+        let fallback = run_git_output(fallback, "clone fallback", workspace_prep_timeout()).await?;
+        if !fallback.status.success() {
+            return Err(anyhow::anyhow!(
+                "checkout clone failed for run {}: {} (local-clone error: {})",
+                run_id,
+                String::from_utf8_lossy(&fallback.stderr).trim(),
+                String::from_utf8_lossy(&clone.stderr).trim()
+            ));
+        }
+    }
+    if seed_cache {
+        if let Err(error) = seed_object_cache(&cache, &workspace, repo_id, run_id).await {
+            tracing::warn!(run = %run_id, repo = %repo_id, error = %error,
+                "could not seed the object cache; future runs clone from the bare repository");
+        }
     }
 
     let mut checkout = tokio::process::Command::new("git");
@@ -2060,6 +2116,153 @@ async fn prepare_run_workspace(
 /// sits far above the slowest observed legitimate clone — the reconciler's
 /// own grace window documents multi-gigabyte clones at minutes — and the
 /// override exists for hosts that legitimately need longer.
+/// Object-cache root: one bare mirror per repository, on the workspace
+/// volume so a workspace clone is a same-filesystem local copy. The bare
+/// repository on the NAS spinner is only ever read incrementally (a fetch
+/// of the delta), never re-transferred wholesale per run.
+// TODO: add periodic cleanup of _objects dirs for deleted repos
+/// Clean up stale object cache directories for repos that no longer exist.
+/// Scans _objects/<repo_id>/ for dirs whose repo_id is not in the active DB.
+/// Returns the number of stale dirs removed.
+async fn cleanup_stale_object_caches(workspace_root: &std::path::Path) -> anyhow::Result<usize> {
+    let objects_dir = workspace_root.join("_objects");
+    if !objects_dir.is_dir() {
+        return Ok(0);
+    }
+
+    // Build set of active repo IDs from the database
+    let db_url = std::env::var("DATABASE_URL")?;
+    let pool = gitforge_db::Pool::new(&db_url).await?;
+    let mut active_repos = std::collections::HashSet::new();
+    if let Ok(rows) = sqlx::query_scalar::<_, String>(
+        "SELECT DISTINCT repo_id FROM repositories WHERE repo_id IS NOT NULL",
+    )
+    .fetch_all(pool.pool())
+    .await
+    {
+        for row in rows {
+            active_repos.insert(row);
+        }
+    }
+    let mut removed = 0;
+
+    for entry in objects_dir.read_dir().into_iter().flatten() {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let repo_id = path.file_name().and_then(|n| n.to_str()).map(String::from);
+        if let Some(ref rid) = repo_id {
+            if !active_repos.contains(rid) {
+                if let Err(e) = tokio::fs::remove_dir_all(&path).await {
+                    tracing::warn!(error = %e, repo_id = rid, "failed to remove stale object cache");
+                } else {
+                    removed += 1;
+                }
+            }
+        }
+    }
+
+    Ok(removed)
+}
+
+fn object_cache_path(repo_id: gitforge_common::RepoId) -> std::path::PathBuf {
+    workspace_root().join("_objects").join(repo_id.to_string())
+}
+
+/// Bring the per-repo object cache up to date with the bare repository.
+///
+/// First use creates the cache as a bare clone (one full transfer, once);
+/// every later run pays only a `git fetch --prune` of the delta. A cache
+/// that exists but cannot be refreshed is an error: the caller falls back
+/// to cloning from the bare repository, so a corrupt cache degrades to the
+/// old slow path instead of failing runs.
+async fn refresh_object_cache(
+    cache: &std::path::Path,
+    source: &std::path::Path,
+    run_id: gitforge_common::PipelineRunId,
+) -> anyhow::Result<()> {
+    if tokio::fs::try_exists(cache).await? {
+        let mut fetch = tokio::process::Command::new("git");
+        fetch
+            .arg("-C")
+            .arg(cache)
+            .args(["fetch", "--prune", "--force", "origin"])
+            .args(["+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*"]);
+        let fetch = run_git_output(fetch, "cache fetch", workspace_prep_timeout()).await?;
+        if !fetch.status.success() {
+            anyhow::bail!(
+                "object cache fetch failed: {}",
+                String::from_utf8_lossy(&fetch.stderr).trim()
+            );
+        }
+        Ok(())
+    } else {
+        if let Some(parent) = cache.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        let staged = cache.with_extension("cloning");
+        let _ = tokio::fs::remove_dir_all(&staged).await;
+        let mut seed = tokio::process::Command::new("git");
+        seed.args(["clone", "--mirror"])
+            .arg(source.as_os_str())
+            .arg(&staged);
+        let seed = run_git_output(seed, "cache seed clone", workspace_prep_timeout()).await?;
+        if !seed.status.success() {
+            let _ = tokio::fs::remove_dir_all(&staged).await;
+            anyhow::bail!(
+                "object cache seed clone failed: {}",
+                String::from_utf8_lossy(&seed.stderr).trim()
+            );
+        }
+        tokio::fs::rename(&staged, cache)
+            .await
+            .map_err(|error| anyhow::anyhow!("object cache rename failed: {error}"))?;
+        tracing::info!(run = %run_id, cache = %cache.display(), "seeded object cache");
+        Ok(())
+    }
+}
+
+/// Seed the object cache from a workspace that was cloned the slow way
+/// (straight from the bare repository). The workspace's `origin` remote
+/// points at the bare repository, so the mirror fetches from it once and
+/// future runs take the fast path. Best-effort: failure only means the
+/// next run pays the slow clone again.
+async fn seed_object_cache(
+    cache: &std::path::Path,
+    workspace: &std::path::Path,
+    repo_id: gitforge_common::RepoId,
+    run_id: gitforge_common::PipelineRunId,
+) -> anyhow::Result<()> {
+    let target = object_cache_path(repo_id);
+    if tokio::fs::try_exists(&target).await? {
+        return Ok(());
+    }
+    if let Some(parent) = target.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let mut seed = tokio::process::Command::new("git");
+    seed.args(["clone", "--mirror"])
+        .arg(workspace.as_os_str())
+        .arg(cache);
+    let seed = run_git_output(
+        seed,
+        "cache mirror from workspace",
+        workspace_prep_timeout(),
+    )
+    .await?;
+    if !seed.status.success() {
+        let _ = tokio::fs::remove_dir_all(cache).await;
+        anyhow::bail!(
+            "object cache mirror clone failed: {}",
+            String::from_utf8_lossy(&seed.stderr).trim()
+        );
+    }
+    tracing::info!(run = %run_id, cache = %cache.display(), "seeded object cache from workspace");
+    Ok(())
+}
+
 fn workspace_prep_timeout() -> Duration {
     parse_workspace_prep_timeout(std::env::var("GITFORGE_WORKSPACE_PREP_TIMEOUT_SECS").ok())
 }
@@ -2124,6 +2327,10 @@ const DEFAULT_TRIGGER_CONCURRENCY: usize = 4;
 /// main-branch trigger requests pending for hours).
 type EventLaneKey = (gitforge_common::RepoId, String);
 type LaneMap = HashMap<EventLaneKey, tokio::sync::mpsc::UnboundedSender<EventEnvelope>>;
+
+/// Maximum number of active event lanes. Lanes exceeding this limit are
+/// evicted on next access. This caps memory usage in high-churn scenarios.
+const MAX_EVENT_LANES: usize = 1000;
 
 fn event_lane_key(event: &EventEnvelope) -> EventLaneKey {
     match &event.payload {
@@ -2243,11 +2450,23 @@ async fn run_event_consumer(
                         Some(event) => {
                             tracing::debug!("received event: {:?}", event.event_type);
                             let lane_sender = {
+                                let key = event_lane_key(&event);
+                                // Enforce MAX_EVENT_LANES cap: evict least-recently-used lanes
+                                // when the map exceeds the limit. Lanes are never actively
+                                // closed — evicted lanes' senders are dropped, closing the
+                                // channel and signaling consumers to drop events.
                                 let mut lanes = lanes
                                     .lock()
                                     .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                if lanes.len() > MAX_EVENT_LANES {
+                                    // Remove the first (oldest) entry
+                                    let first_key = lanes.keys().next().cloned();
+                                    if let Some(k) = first_key {
+                                        lanes.remove(&k);
+                                    }
+                                }
                                 lanes
-                                    .entry(event_lane_key(&event))
+                                    .entry(key)
                                     .or_insert_with(|| {
                                         spawn_trigger_lane(
                                             scheduler.clone(),
@@ -2527,9 +2746,27 @@ async fn handle_push_event(
     let trigger_event = create_trigger_event(repo_id, &payload.new_hash, ref_name);
     let pipeline_id = trigger_event.pipeline_id;
 
+    // The commit the ref pointed at BEFORE this push. A branch creation
+    // carries an all-zero old hash: there is no base, so nothing is
+    // published and the consumer fails safe. The base must travel with the
+    // run because the CI workspace clones AFTER the push landed — inside
+    // the workspace `origin/main` already IS the pushed tip, so a merge-base
+    // range diff is empty by construction and the only surviving base is
+    // the one the platform captured at push time.
+    let push_base = if gitforge_common::is_zero_hash(&payload.old_hash) {
+        None
+    } else {
+        Some(payload.old_hash.clone())
+    };
+
+    // The engine runs the augmented definition; the committed definition
+    // stays pristine for the pipeline cache and the persisted pipeline
+    // config, so a later run does not inherit a stale push base.
+    let engine_pipeline = gitforge_ci::pipeline::with_push_base(&pipeline, push_base.as_deref());
+
     // Create and start the CI engine
     let engine = Arc::new(
-        CiEngine::new(trigger_event, pipeline.clone())
+        CiEngine::new(trigger_event, engine_pipeline)
             .await
             .map_err(|e| TriggerFailure::terminal(e.into()))?,
     );
@@ -2574,6 +2811,7 @@ async fn handle_push_event(
         );
         db_run.id = state.run_id;
         db_run.ref_name = Some(payload.ref_name.clone());
+        db_run.push_base_sha = push_base.clone();
         db_run.start();
         gitforge_db::queries::PipelineQueries::activate_pipeline_and_create_run(
             pool,
@@ -2621,6 +2859,25 @@ async fn handle_push_event(
                     state.run_id
                 ))
             })?;
+            // Durable-plan BEFORE the workspace clone. prepare_run_workspace
+            // clones the whole bare repository, and on slow storage it can
+            // take minutes or hang (GF-19: the 2026-11-06 runs stranded as
+            // `running` with ZERO job rows because planning ran only after
+            // the clone returned). The clone does not affect the job SET or
+            // any definition field except the workspace fallback in
+            // `working_dir`, and enqueue_ready_jobs' upsert re-persists the
+            // full execution plan with the real workspace path, so a row
+            // written now is corrected before any runner sees it. A hung
+            // clone now strands a PLANNED run: rows exist, reconciliation
+            // and the store see the run's true shape, and a clone failure
+            // grades the run failed with traceable rows instead of a hollow
+            // `running`.
+            if let Err(error) = persist_planned_jobs(pool, &engine, state.run_id, None).await {
+                tracing::error!(run = %state.run_id, %error, "failed to persist planned jobs before workspace prep");
+                fail_run(pool, state.run_id, &error).await;
+                pipeline_registry.write().await.remove(&state.run_id);
+                return Err(TriggerFailure::terminal_after_run(error, state.run_id));
+            }
             match prepare_run_workspace(pool, repo_id, state.run_id, &payload.new_hash).await {
                 Ok(path) => Some(path),
                 Err(error) => {
@@ -2821,20 +3078,50 @@ async fn run_scheduler_event_consumer(
             Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
             Err(_) => break,
         };
-        let SchedulerEvent::JobCompleted {
-            job_id,
-            pipeline_run_id,
-            runner_id,
-            success,
-        } = event
-        else {
-            continue;
+        let (job_id, pipeline_run_id, runner_id, success, outcome) = match event {
+            SchedulerEvent::JobAssigned {
+                job_id,
+                runner_id,
+                pipeline_run_id,
+            } => {
+                // The engine's mirror must leave `Queued` when the job is
+                // dispatched: `ready_jobs()` releases every job that is
+                // still `Queued`, so a dispatched job whose mirror stayed
+                // `Queued` was re-enqueued by every later completion of
+                // the run. That duplicate enqueue demoted the running
+                // job's durable row, which refused the runner's heartbeat
+                // and rotated its lease token (GF-12).
+                // Keep the registry read guard through the state transition.
+                // Reconciliation replaces engines under the write guard, so
+                // it must not swap out this engine between lookup and mutate.
+                let registry = pipeline_registry.read().await;
+                let engine = registry.get(&pipeline_run_id).cloned();
+                let Some(engine) = engine else {
+                    tracing::warn!(
+                        "assignment received for unknown pipeline run {}",
+                        pipeline_run_id
+                    );
+                    continue;
+                };
+                if let Err(error) = engine.assign_job(job_id, runner_id).await {
+                    tracing::error!(%job_id, %error, "failed to mark the dispatched job assigned");
+                }
+                continue;
+            }
+            SchedulerEvent::JobCompleted {
+                job_id,
+                pipeline_run_id,
+                runner_id,
+                outcome,
+                success,
+            } => (job_id, pipeline_run_id, runner_id, success, outcome),
+            _ => continue,
         };
-        let engine = pipeline_registry
-            .read()
-            .await
-            .get(&pipeline_run_id)
-            .cloned();
+        // Reconciliation may replace a stale engine. Hold the read guard
+        // until this event has been applied so the old Arc cannot be mutated
+        // after a replacement has entered the registry.
+        let registry = pipeline_registry.read().await;
+        let engine = registry.get(&pipeline_run_id).cloned();
         let Some(engine) = engine else {
             tracing::warn!(
                 "completion received for unknown pipeline run {}",
@@ -2850,28 +3137,36 @@ async fn run_scheduler_event_consumer(
             tracing::error!(%job_id, %error, "failed to mark completed job running");
             continue;
         }
-        if success {
-            if let Err(error) = engine.succeed_job(job_id, 0).await {
-                tracing::error!(%job_id, %error, "failed to mark job succeeded");
-                continue;
+        match outcome {
+            gitforge_scheduler::assigner::JobOutcome::Succeeded => {
+                if let Err(error) = engine.succeed_job(job_id, 0).await {
+                    tracing::error!(%job_id, %error, "failed to mark job succeeded");
+                    continue;
+                }
+                // The job's receipt is the only source of the CI_CHANGE_* vars
+                // that `skip_if` conditions are evaluated against. Merging them
+                // has to happen before the downstream release: an unmerged
+                // receipt leaves the expression environment empty, every
+                // condition evaluates false, and the engine silently prunes
+                // every gated job.
+                merge_completed_job_env(&engine, scheduler_db.as_ref(), job_id).await;
+                if let Err(error) = engine.queue_ready_jobs().await {
+                    tracing::error!(%pipeline_run_id, %error, "failed to queue downstream jobs");
+                }
+                persist_skipped_job_rows(scheduler_db.as_ref(), &engine).await;
             }
-            // The job's receipt is the only source of the CI_CHANGE_* vars
-            // that `skip_if` conditions are evaluated against. Merging them
-            // has to happen before the downstream release: an unmerged
-            // receipt leaves the expression environment empty, every
-            // condition evaluates false, and the engine silently prunes
-            // every gated job.
-            merge_completed_job_env(&engine, scheduler_db.as_ref(), job_id).await;
-            if let Err(error) = engine.queue_ready_jobs().await {
-                tracing::error!(%pipeline_run_id, %error, "failed to queue downstream jobs");
+            gitforge_scheduler::assigner::JobOutcome::InfrastructureFailure => {
+                if let Err(error) = engine.fail_infrastructure_job(job_id, -1).await {
+                    tracing::error!(%job_id, %error, "failed to mark job infrastructure failure");
+                }
             }
-            persist_skipped_job_rows(scheduler_db.as_ref(), &engine).await;
-        } else {
-            if let Err(error) = engine
-                .fail_job(job_id, -1, "runner reported failure".to_string())
-                .await
-            {
-                tracing::error!(%job_id, %error, "failed to mark job failed");
+            _ => {
+                if let Err(error) = engine
+                    .fail_job(job_id, -1, "runner reported failure".to_string())
+                    .await
+                {
+                    tracing::error!(%job_id, %error, "failed to mark job failed");
+                }
             }
         }
 
@@ -2890,6 +3185,7 @@ async fn run_scheduler_event_consumer(
             workspace_path,
         )
         .await;
+        drop(registry);
 
         // No-op until every job in the run is terminal; see
         // `finalize_run_if_terminal`.
@@ -2960,7 +3256,11 @@ async fn finalize_run_if_terminal(
     let root = workspace_root();
     let run_id = state.run_id;
     tokio::spawn(async move {
-        remove_run_workspace_dir(&root, run_id, workspace_path.as_deref()).await;
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(300),
+            remove_run_workspace_dir(&root, run_id, workspace_path.as_deref()),
+        )
+        .await;
     });
     pipeline_registry.write().await.remove(&state.run_id);
 }
@@ -3034,17 +3334,26 @@ fn execution_plan(
         .iter()
         .map(|step| step.run.clone())
         .collect();
-    let working_dir = definition
+    let container_working_dir = definition
         .steps
         .iter()
-        .find_map(|step| step.working_directory.clone())
-        .or_else(|| workspace_path.map(str::to_string));
+        .find_map(|step| step.working_directory.clone());
+    let step_working_directories = definition
+        .steps
+        .iter()
+        .map(|step| step.working_directory.clone())
+        .collect();
+    let workspace_path = workspace_path.map(str::to_string);
+    let working_dir = workspace_path.clone();
     let timeout_secs = definition
         .timeout_secs()
         .unwrap_or(DEFAULT_JOB_TIMEOUT_SECS);
     JobExecutionDefinition {
         commands,
         image: definition.image.clone(),
+        workspace_path,
+        container_working_dir,
+        step_working_directories,
         working_dir,
         timeout_secs,
         // The DAG builder has already merged pipeline `environment` into the
@@ -3141,6 +3450,18 @@ async fn persist_planned_jobs(
         // Durable-write discipline (F21/F23): losing one row to a transient
         // busy aborts the whole loop and strands a half-planned run (the
         // caller fails it), so each row fights contention instead.
+        // Skip rows the pre-clone planning pass already wrote (GF-19:
+        // planning runs before AND after the workspace clone so a hung
+        // clone cannot strand a jobless `running` row). A plain re-create
+        // would hit the unique id and fail the run; the working_dir the
+        // second pass would correct is fixed at dispatch time anyway, when
+        // enqueue_ready_jobs' upsert rewrites the full definition.
+        if gitforge_db::queries::JobQueries::get(pool, db_job.id)
+            .await
+            .is_ok_and(|row| row.is_some())
+        {
+            continue;
+        }
         persist_with_retry(|| gitforge_db::queries::JobQueries::create(pool, &db_job)).await?;
     }
     tracing::info!(run = %run_id, planned = planned.len(), "persisted planned job rows");
@@ -3167,7 +3488,48 @@ async fn persist_planned_jobs(
 /// - all rows terminal: reconciliation grades the run, which also catches
 ///   the incomplete-chain shortfall a rebuilt engine would wrongly
 ///   finalize as success.
-async fn rebuild_live_engines(
+fn engine_matches_durable_rows(
+    state: &gitforge_ci::engine::CiEngineState,
+    rows: &[(
+        gitforge_common::JobId,
+        String,
+        gitforge_common::JobStatus,
+        Option<chrono::DateTime<chrono::Utc>>,
+    )],
+) -> bool {
+    state.jobs.len() == rows.len()
+        && rows.iter().all(|(job_id, _, durable_status, _)| {
+            state
+                .jobs
+                .get(job_id)
+                .is_some_and(|engine_job| engine_job.status() == *durable_status)
+        })
+}
+
+fn engine_states_match(
+    left: &gitforge_ci::engine::CiEngineState,
+    right: &gitforge_ci::engine::CiEngineState,
+) -> bool {
+    left.jobs.len() == right.jobs.len()
+        && left.jobs.iter().all(|(job_id, left_job)| {
+            right
+                .jobs
+                .get(job_id)
+                .is_some_and(|right_job| left_job.status() == right_job.status())
+        })
+}
+
+#[cfg(test)]
+fn engine_has_in_flight_job(state: &gitforge_ci::engine::CiEngineState) -> bool {
+    state.jobs.values().any(|job| {
+        matches!(
+            job.status(),
+            gitforge_common::JobStatus::Assigned | gitforge_common::JobStatus::Running
+        )
+    })
+}
+
+async fn reconcile_live_engines(
     pool: &gitforge_db::Pool,
     scheduler: &Scheduler,
     pipeline_registry: &Arc<tokio::sync::RwLock<PipelineRegistry>>,
@@ -3183,7 +3545,7 @@ async fn rebuild_live_engines(
         }
     };
 
-    let mut rebuilt = 0;
+    let mut redriven = 0;
     for run in runs {
         if matches!(
             run.status.as_str(),
@@ -3268,28 +3630,47 @@ async fn rebuild_live_engines(
             // this class.
             continue;
         }
-        // Custody is not protection here: rebuilding over a held engine is
-        // loss-free exactly when nothing is executing, because the fresh
-        // engine grafts the same durable truth. The stall classes this pass
-        // exists for — a startup rebuild that failed, queued rows lost from
-        // the scheduler's in-memory queue, a completion event dropped before
-        // the engine absorbed it — all leave no running row behind, and the
-        // stalled chains observed live (tail rows pending for ~21h across a
-        // control-plane restart) are exactly of that shape.
-        let engine = match CiEngine::rebuild(
-            run.id,
-            run.pipeline_id,
-            run.repo_id,
-            definition,
-            &durable_rows,
-        )
-        .await
-        {
-            Ok(engine) => Arc::new(engine),
-            Err(error) => {
-                tracing::error!(run = %run.id, %error, "engine rebuild failed");
-                continue;
+        // Reuse a custody-held engine when its job states already match the
+        // durable rows. The common redrive below still repairs missing queue
+        // entries and releases newly-ready stages, but does not replace a
+        // healthy in-memory graph every five minutes. A mismatch means a
+        // completion event or queue transition may have been lost, so graft
+        // durable state onto a fresh engine.
+        // The persisted pipeline config holds the committed definition
+        // (no push base); the run row holds the base the push carried.
+        // Re-injecting it here is what makes the push base survive a
+        // control-plane restart — the `jobs` table has no env column, so
+        // this is the only durable carrier.
+        let definition =
+            gitforge_ci::pipeline::with_push_base(&definition, run.push_base_sha.as_deref());
+        let existing_engine = if held {
+            pipeline_registry.read().await.get(&run.id).cloned()
+        } else {
+            None
+        };
+        let existing_state = match existing_engine.as_ref() {
+            Some(engine) => Some(engine.state().await),
+            None => None,
+        };
+        let (mut engine, mut engine_action) = match (&existing_engine, &existing_state) {
+            (Some(engine), Some(state)) if engine_matches_durable_rows(state, &durable_rows) => {
+                (engine.clone(), "reused")
             }
+            _ => match CiEngine::rebuild(
+                run.id,
+                run.pipeline_id,
+                run.repo_id,
+                definition,
+                &durable_rows,
+            )
+            .await
+            {
+                Ok(engine) => (Arc::new(engine), "rebuilt"),
+                Err(error) => {
+                    tracing::error!(run = %run.id, %error, "engine rebuild failed");
+                    continue;
+                }
+            },
         };
         // Bound the guard to its own statement so it never spans the
         // `prepare_run_workspace` await (the future must stay Send).
@@ -3319,10 +3700,56 @@ async fn rebuild_live_engines(
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .insert(run.id, workspace_path.clone());
-        pipeline_registry
-            .write()
-            .await
-            .insert(run.id, engine.clone());
+        // The event consumer holds the registry read guard through each
+        // engine transition. Re-read durable rows after workspace recovery
+        // while holding the write guard: the first snapshot can go stale
+        // while recovery is suspended, and an event may be waiting to update
+        // the engine mirror.
+        let mut registry = pipeline_registry.write().await;
+        let latest_rows = match gitforge_db::queries::JobQueries::list_by_run(pool, run.id).await {
+            Ok(rows) => rows,
+            Err(error) => {
+                tracing::warn!(run = %run.id, %error, "engine reconciliation skipped: latest job rows unreadable");
+                continue;
+            }
+        };
+        let latest_durable_rows: Option<Vec<_>> = latest_rows
+            .iter()
+            .map(|job| {
+                let status = gitforge_db::models::JobStatus::from_str(&job.status)?;
+                Some((job.id, job.name.clone(), status.to_common(), job.started_at))
+            })
+            .collect();
+        if latest_durable_rows.as_ref() != Some(&durable_rows) {
+            tracing::debug!(
+                run = %run.id,
+                "engine reconciliation skipped: durable job rows advanced during workspace recovery"
+            );
+            continue;
+        }
+        if let Some(current_engine) = registry.get(&run.id).cloned() {
+            let current_state = current_engine.state().await;
+            if engine_matches_durable_rows(&current_state, &durable_rows) {
+                // An event may have brought the in-memory engine into
+                // agreement while workspace recovery was awaited. Keep that
+                // engine rather than replacing it with the earlier snapshot.
+                engine = current_engine;
+                engine_action = "reused";
+            } else if existing_state
+                .as_ref()
+                .is_none_or(|before| !engine_states_match(before, &current_state))
+            {
+                // The durable snapshot or engine advanced after the initial
+                // read. Leave the registry untouched and retry from a fresh
+                // snapshot on the next pass.
+                tracing::debug!(
+                    run = %run.id,
+                    "engine reconciliation skipped: live engine advanced during snapshot"
+                );
+                continue;
+            }
+        }
+        registry.insert(run.id, engine.clone());
         // Re-drive the DAG. Rows the scheduler had already queued are
         // re-enqueued (the upsert refreshes the durable row; the scheduler
         // deduplicates its in-memory queue), and any stage whose
@@ -3346,16 +3773,16 @@ async fn rebuild_live_engines(
         if let Err(error) = engine.queue_ready_jobs().await {
             tracing::warn!(run = %run.id, %error, "post-rebuild stage release failed");
         }
+        // Keep the write guard through in-memory environment restoration and
+        // DAG release. Otherwise a completion event could observe the engine
+        // before CI_CHANGE_* receipts have been merged and prune gated jobs.
+        drop(registry);
         persist_skipped_job_rows(Some(pool), &engine).await;
         enqueue_ready_jobs(scheduler, &engine, run.id, run.repo_id, workspace_path).await;
-        if held {
-            tracing::info!(run = %run.id, "redrove stalled chain over live engine");
-        } else {
-            tracing::info!(run = %run.id, "rebuilt live engine for interrupted run");
-        }
-        rebuilt += 1;
+        tracing::info!(run = %run.id, engine_action, "redrove durable pipeline state");
+        redriven += 1;
     }
-    rebuilt
+    redriven
 }
 
 /// Create a trigger event from push payload (extracted for testability)
@@ -3441,6 +3868,56 @@ mod tests {
     use std::sync::OnceLock;
 
     static WORKSPACE_TEST_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+
+    #[test]
+    fn engine_matches_durable_rows_requires_exact_job_ids_and_statuses() {
+        let run_id = gitforge_common::PipelineRunId::new();
+        let pipeline_id = gitforge_common::PipelineId::new();
+        let repo_id = gitforge_common::RepoId::new();
+        let queued_id = gitforge_common::JobId::new();
+        let pending_id = gitforge_common::JobId::new();
+        let mut state = gitforge_ci::engine::CiEngineState::new(run_id, pipeline_id, repo_id);
+
+        let mut queued = gitforge_ci::JobStateMachine::new(queued_id);
+        queued.restore(gitforge_common::JobStatus::Queued, None);
+        state.jobs.insert(queued_id, queued);
+        state
+            .jobs
+            .insert(pending_id, gitforge_ci::JobStateMachine::new(pending_id));
+
+        let durable_rows = vec![
+            (
+                queued_id,
+                "queued".to_string(),
+                gitforge_common::JobStatus::Queued,
+                None,
+            ),
+            (
+                pending_id,
+                "pending".to_string(),
+                gitforge_common::JobStatus::Pending,
+                None,
+            ),
+        ];
+        assert!(engine_matches_durable_rows(&state, &durable_rows));
+
+        let mut stale_rows = durable_rows.clone();
+        stale_rows[0].2 = gitforge_common::JobStatus::Running;
+        assert!(!engine_matches_durable_rows(&state, &stale_rows));
+
+        assert!(!engine_matches_durable_rows(&state, &durable_rows[..1]));
+        assert!(engine_states_match(&state, &state));
+        assert!(!engine_has_in_flight_job(&state));
+
+        let mut assigned_state = state.clone();
+        assigned_state
+            .jobs
+            .get_mut(&queued_id)
+            .expect("queued state")
+            .restore(gitforge_common::JobStatus::Assigned, None);
+        assert!(!engine_states_match(&state, &assigned_state));
+        assert!(engine_has_in_flight_job(&assigned_state));
+    }
 
     #[test]
     fn lane_key_separates_refs_within_a_repo() {
@@ -4390,7 +4867,7 @@ mod tests {
     }
 
     // The F21 scenario end to end: a trigger plans every stage durably, the
-    // control plane dies mid-chain, and on restart `rebuild_live_engines`
+    // control plane dies mid-chain, and on restart `reconcile_live_engines`
     // reconstructs an engine that resumes the chain from the surviving rows
     // instead of leaving the tail unenqueued.
     #[tokio::test]
@@ -4528,8 +5005,8 @@ mod tests {
             std::sync::Mutex<HashMap<gitforge_common::PipelineRunId, Option<String>>>,
         > = Arc::new(std::sync::Mutex::new(HashMap::new()));
 
-        let rebuilt = rebuild_live_engines(&pool, &scheduler, &registry, &run_workspaces).await;
-        assert_eq!(rebuilt, 1, "the interrupted run gets an engine back");
+        let redriven = reconcile_live_engines(&pool, &scheduler, &registry, &run_workspaces).await;
+        assert_eq!(redriven, 1, "the interrupted run gets an engine back");
 
         let engine = registry
             .read()
@@ -4568,6 +5045,24 @@ mod tests {
         assert_eq!(queue.in_memory_queued, 1);
         assert_eq!(queue.durable_pending, Some(1));
 
+        // The live engine already matches durable job status. A repeated
+        // reconciliation must re-seed idempotently without replacing it.
+        let original_engine = engine.clone();
+        let redriven = reconcile_live_engines(&pool, &scheduler, &registry, &run_workspaces).await;
+        assert_eq!(redriven, 1);
+        let reused_engine = registry
+            .read()
+            .await
+            .get(&run.id)
+            .cloned()
+            .expect("reconciled engine");
+        assert!(
+            Arc::ptr_eq(&original_engine, &reused_engine),
+            "matching durable state must reuse the live engine"
+        );
+        let queue = scheduler.queue_status().await.unwrap();
+        assert_eq!(queue.in_memory_queued, 1, "queue repair is idempotent");
+
         // The completion consumer's advance path: stage b finishes, stage c
         // is released and durably flipped to dispatchable.
         let runner_id = gitforge_common::RunnerId::new();
@@ -4586,10 +5081,10 @@ mod tests {
         assert_eq!(queue.in_memory_queued, 2);
         assert_eq!(queue.durable_pending, Some(2));
 
-        // A later pass re-drives the same run: nothing is executing, so the
-        // fresh engine grafts identical durable truth and the chain is
-        // re-seeded without disturbing live state.
-        let redriven = rebuild_live_engines(&pool, &scheduler, &registry, &run_workspaces).await;
+        // A later pass sees that stage b's engine state (`succeeded`) differs
+        // from the durable row (`queued`), so it grafts durable truth before
+        // re-seeding. This protects the engine after a lost status transition.
+        let redriven = reconcile_live_engines(&pool, &scheduler, &registry, &run_workspaces).await;
         assert_eq!(
             redriven, 1,
             "an idle custody-held run is re-driven, not skipped"
@@ -4748,7 +5243,7 @@ mod tests {
         > = Arc::new(std::sync::Mutex::new(HashMap::new()));
         let scheduler = Arc::new(Scheduler::with_db(pool.clone()));
 
-        let redriven = rebuild_live_engines(&pool, &scheduler, &registry, &run_workspaces).await;
+        let redriven = reconcile_live_engines(&pool, &scheduler, &registry, &run_workspaces).await;
         assert_eq!(redriven, 1, "the stalled chain is re-driven");
 
         // The fresh engine grafted the durable completion...
@@ -5990,6 +6485,248 @@ jobs:
         );
     }
 
+    // --- Push base publication (CI_PUSH_BASE_SHA) ---
+    //
+    // The CI workspace clones AFTER the push landed, so inside the
+    // workspace `origin/main` already IS the pushed tip: a merge-base range
+    // diff is empty by construction, and the tip commit alone describes
+    // only the last commit of a multi-commit push. The pre-push tip is the
+    // only base that describes the whole push, and it reaches the consumer
+    // solely through the job environment.
+
+    /// A two-job definition whose pipeline-level environment is empty, so
+    /// the push base is the only variable a job can carry.
+    fn push_base_pipeline() -> PipelineDefinition {
+        let job = |name: &str, needs: &[&str]| JobDefinition {
+            name: name.to_string(),
+            image: "rust:latest".to_string(),
+            needs: needs.iter().map(ToString::to_string).collect(),
+            env: HashMap::new(),
+            steps: vec![StepDefinition {
+                name: format!("{name}-step"),
+                run: "true".to_string(),
+                env: None,
+                working_directory: None,
+                condition: None,
+            }],
+            timeout: None,
+            retry: None,
+            skip_if: None,
+            volumes: Vec::new(),
+            cache: None,
+            lane: Default::default(),
+            fault: None,
+        };
+        PipelineDefinition {
+            name: "push-base-pipeline".to_string(),
+            version: "1.0".to_string(),
+            trigger_on: vec![TriggerType::Push],
+            environment: HashMap::new(),
+            jobs: vec![
+                job("detect-changes", &[]),
+                job("clippy", &["detect-changes"]),
+            ],
+        }
+    }
+
+    /// A push envelope for `repo_id` carrying `old_hash` as the pre-push
+    /// tip of the ref.
+    fn push_envelope(repo_id: gitforge_common::RepoId, old_hash: &str) -> EventEnvelope {
+        EventEnvelope::new(
+            EventType::PushReceived,
+            EventPayload::PushReceived(PushReceivedPayload {
+                repo_id,
+                ref_name: "refs/heads/main".to_string(),
+                old_hash: old_hash.to_string(),
+                new_hash: "b".repeat(40),
+                pusher_id: None,
+                pipeline_id: None,
+            }),
+            Some(repo_id),
+            None,
+        )
+    }
+
+    /// What one push produced: the durable run row, the environment of every
+    /// planned job, and the definition the pipeline cache kept.
+    struct PushOutcome {
+        run: gitforge_db::models::PipelineRun,
+        job_envs: Vec<(String, HashMap<String, String>)>,
+        cached_environment: HashMap<String, String>,
+        persisted_environment: HashMap<String, String>,
+    }
+
+    /// Drive one push through `handle_push_event` and collect what it
+    /// produced.
+    async fn plan_push(old_hash: &str) -> PushOutcome {
+        let pool = gitforge_db::Pool::memory().await.expect("memory pool");
+        pool.migrate().await.expect("migrate");
+        let user = gitforge_db::models::User::new(
+            "push-base-owner".to_string(),
+            "push-base-owner@example.test".to_string(),
+            "hash".to_string(),
+        );
+        gitforge_db::queries::UserQueries::create(&pool, &user)
+            .await
+            .expect("create user");
+        let repo_id = gitforge_common::RepoId::new();
+        gitforge_db::queries::RepoQueries::create(
+            &pool,
+            &gitforge_db::models::Repository::new_with_id(
+                repo_id,
+                "push-base-repo".to_string(),
+                user.id,
+                std::env::temp_dir()
+                    .join(format!("gitforge-push-base-{repo_id}"))
+                    .display()
+                    .to_string(),
+            ),
+        )
+        .await
+        .expect("create repository");
+
+        let scheduler = Arc::new(Scheduler::new());
+        let pipeline_cache: Arc<std::sync::Mutex<PipelineCache>> =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
+        pipeline_cache
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(repo_id, push_base_pipeline());
+        // The workspace is pre-seeded so the push plans without cloning: the
+        // subject here is the environment the jobs carry, not the checkout.
+        let workspace_paths: Arc<
+            std::sync::Mutex<HashMap<gitforge_common::RepoId, Option<String>>>,
+        > = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        workspace_paths
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(
+                repo_id,
+                Some("/tmp/gitforge-push-base-workspace".to_string()),
+            );
+        let run_workspace_paths = run_workspace_paths_cache();
+        let pipeline_registry: Arc<tokio::sync::RwLock<PipelineRegistry>> =
+            Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+
+        let outcome = handle_push_event(
+            &push_envelope(repo_id, old_hash),
+            &scheduler,
+            &pipeline_cache,
+            Some(&pool),
+            &workspace_paths,
+            &run_workspace_paths,
+            &pipeline_registry,
+        )
+        .await
+        .expect("a push plans a run");
+        let TriggerOutcome::Started(run_id) = outcome else {
+            panic!("a push must start a run");
+        };
+
+        let run = gitforge_db::queries::PipelineRunQueries::get(&pool, run_id)
+            .await
+            .expect("read run row")
+            .expect("durable run row");
+        let engine = pipeline_registry
+            .read()
+            .await
+            .get(&run_id)
+            .cloned()
+            .expect("the planned engine is registered");
+        let job_envs = engine
+            .planned_jobs()
+            .into_iter()
+            .map(|(job_id, name)| {
+                let env = engine
+                    .job_definition(job_id)
+                    .expect("planned job definition")
+                    .env;
+                (name, env)
+            })
+            .collect();
+
+        let cached_environment = pipeline_cache
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&repo_id)
+            .expect("cached definition")
+            .environment
+            .clone();
+        let persisted_environment =
+            gitforge_db::queries::PipelineQueries::get(&pool, run.pipeline_id)
+                .await
+                .expect("read pipeline row")
+                .expect("durable pipeline row")
+                .config
+                .get("environment")
+                .and_then(|value| serde_json::from_value(value.clone()).ok())
+                .unwrap_or_default();
+
+        PushOutcome {
+            run,
+            job_envs,
+            cached_environment,
+            persisted_environment,
+        }
+    }
+
+    // The pre-push tip must reach EVERY planned job: a classifier that
+    // reads only its own job's environment sees an empty range otherwise.
+    #[tokio::test]
+    async fn test_push_event_publishes_the_push_base_to_every_job() {
+        let old_hash = "a".repeat(40);
+        let outcome = plan_push(&old_hash).await;
+
+        assert_eq!(
+            outcome.run.push_base_sha.as_deref(),
+            Some(old_hash.as_str()),
+            "the durable run row carries the pre-push tip"
+        );
+        assert_eq!(outcome.run.ref_name.as_deref(), Some("refs/heads/main"));
+        assert_eq!(outcome.job_envs.len(), 2, "the pipeline has two jobs");
+        for (name, env) in &outcome.job_envs {
+            assert_eq!(
+                env.get(gitforge_ci::pipeline::PUSH_BASE_ENV),
+                Some(&old_hash),
+                "job {name} must carry the pre-push tip"
+            );
+        }
+
+        // The push base belongs to the RUN, not to the definition: the
+        // cached definition and the persisted pipeline config stay pristine
+        // so a later run cannot inherit a stale base.
+        assert!(
+            !outcome
+                .cached_environment
+                .contains_key(gitforge_ci::pipeline::PUSH_BASE_ENV),
+            "the cached definition must not carry a push base"
+        );
+        assert!(
+            !outcome
+                .persisted_environment
+                .contains_key(gitforge_ci::pipeline::PUSH_BASE_ENV),
+            "the persisted pipeline config must not carry a push base"
+        );
+    }
+
+    // A branch creation has no pre-push tip: nothing is published, so the
+    // consumer sees no variable and fails safe.
+    #[tokio::test]
+    async fn test_push_event_with_a_zero_old_hash_publishes_no_push_base() {
+        let outcome = plan_push(&"0".repeat(40)).await;
+
+        assert_eq!(
+            outcome.run.push_base_sha, None,
+            "a branch creation has no pre-push tip"
+        );
+        for (name, env) in &outcome.job_envs {
+            assert!(
+                !env.contains_key(gitforge_ci::pipeline::PUSH_BASE_ENV),
+                "job {name} must not carry a push base for a branch creation"
+            );
+        }
+    }
+
     // --- Trigger settlement classification ---
     //
     // A committed definition that can never parse must fail terminally and
@@ -6489,5 +7226,101 @@ jobs:
             .expect("skipped job row");
         assert_eq!(row.status, "skipped");
         assert!(row.finished_at.is_some());
+    }
+
+    /// The object-cache lifecycle: a missing cache is seeded by a mirror
+    /// clone, a present cache is refreshed by an incremental fetch that
+    /// observes a new commit, and a corrupt cache is an error the caller
+    /// degrades on rather than a failed run.
+    #[tokio::test]
+    async fn object_cache_seed_refresh_and_corruption_contract() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/gitforge-ci-object-cache-tests")
+            .join(gitforge_common::PipelineRunId::new().to_string());
+        let source = root.join("bare.git");
+        tokio::fs::create_dir_all(&source).await.unwrap();
+        let run = gitforge_common::PipelineRunId::new();
+
+        let git = |args: &[&str], cwd: &std::path::Path| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .expect("git")
+        };
+
+        let out = git(&["init", "--bare", "--initial-branch=main"], &source);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        // A work tree to commit into the bare repo.
+        let work = root.join("work");
+        tokio::fs::create_dir_all(&work).await.unwrap();
+        let out = git(&["init", "-b", "main"], &work);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        tokio::fs::write(work.join("a.txt"), "one").await.unwrap();
+        let out = git(&["add", "."], &work);
+        assert!(out.status.success());
+        let out = git(&["commit", "-m", "one"], &work);
+        assert!(out.status.success());
+        let out = git(
+            &["remote", "add", "origin", source.to_string_lossy().as_ref()],
+            &work,
+        );
+        assert!(out.status.success());
+        let out = git(&["push", "origin", "main"], &work);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        let cache = root.join("_objects").join("cache.git");
+
+        // 1. Missing cache: refresh seeds it and the commit is visible.
+        refresh_object_cache(&cache, &source, run).await.unwrap();
+        let out = git(&["rev-parse", "refs/heads/main"], &cache);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        // 2. Present cache: a refresh after a new push observes the delta.
+        tokio::fs::write(work.join("a.txt"), "two").await.unwrap();
+        assert!(git(&["commit", "-am", "two"], &work).status.success());
+        assert!(git(&["push", "origin", "main"], &work).status.success());
+        refresh_object_cache(&cache, &source, run).await.unwrap();
+        let updated = git(&["rev-parse", "refs/heads/main"], &cache);
+        let pushed = git(&["rev-parse", "main"], &work);
+        assert_eq!(
+            String::from_utf8_lossy(&updated.stdout).trim(),
+            String::from_utf8_lossy(&pushed.stdout).trim(),
+            "refreshed cache must observe the new commit"
+        );
+
+        // 3. Corrupt cache: refresh fails (an error the caller degrades on),
+        //    it does not silently pass.
+        tokio::fs::remove_dir_all(cache.join("objects"))
+            .await
+            .unwrap();
+        let corrupt = refresh_object_cache(&cache, &source, run).await;
+        assert!(
+            corrupt.is_err(),
+            "a corrupt cache must not refresh successfully"
+        );
+
+        tokio::fs::remove_dir_all(&root).await.unwrap();
     }
 }

@@ -41,7 +41,7 @@ for arg in "$@"; do
     case "$arg" in
         -h|--help) show_help; exit 0 ;;
     esac
-fi
+done
 
 WARNINGS=0
 

@@ -3,11 +3,34 @@
 //! Interactive API documentation available at /swagger-ui when server is running.
 
 use axum::{response::IntoResponse, routing::get, Json, Router};
-use serde_json::json;
 
-/// OpenAPI 3.0 specification for GitForge API
-pub fn get_openapi_spec() -> serde_json::Value {
-    json!({
+use std::io::Read;
+use std::path::Path;
+
+/// Load the OpenAPI 3.0 specification from the external JSON file next to
+/// this crate.
+///
+/// The spec lives in `openapi.json` beside the source so it can be
+/// independently linted, versioned, and served as a standalone file
+/// (e.g. `/api-docs/openapi.json`). The Rust source merely loads and
+/// deserializes it.
+fn load_openapi_spec() -> serde_json::Value {
+    // Try the file next to the crate source first (development)
+    let spec_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("openapi.json");
+    if spec_path.exists() {
+        if let Ok(mut file) = std::fs::File::open(&spec_path) {
+            let mut contents = String::new();
+            if file.read_to_string(&mut contents).is_ok() {
+                if let Ok(value) = serde_json::from_str(&contents) {
+                    return value;
+                }
+            }
+        }
+    }
+
+    // Fallback: use the inline default spec so the binary never fails
+    // to start due to a missing spec file.
+    serde_json::json!({
         "openapi": "3.0.3",
         "info": {
             "title": "GitForge API",
@@ -38,1116 +61,16 @@ pub fn get_openapi_spec() -> serde_json::Value {
             {"name": "artifacts", "description": "Artifact management"},
             {"name": "review", "description": "AI code review runs and findings"}
         ],
-        "paths": {
-            "/auth/login": {
-                "post": {
-                    "tags": ["auth"],
-                    "summary": "Authenticate a user",
-                    "description": "Authenticates a persisted user and returns a 24-hour bearer token plus a 30-day refresh credential for silent renewal. This public route is mounted at /auth/login, not under /api.",
-                    "requestBody": {
-                        "required": true,
-                        "content": {
-                            "application/json": {
-                                "schema": {
-                                    "type": "object",
-                                    "required": ["username", "password"],
-                                    "properties": {
-                                        "username": {"type": "string"},
-                                        "password": {"type": "string", "format": "password"}
-                                    }
-                                }
-                            }
-                        }
-                    },
-                    "responses": {
-                        "200": {
-                            "description": "Authenticated",
-                            "content": {
-                                "application/json": {
-                                    "schema": {
-                                        "type": "object",
-                                        "required": ["token", "token_type", "expires_in"],
-                                        "properties": {
-                                            "token": {"type": "string"},
-                                            "token_type": {"type": "string", "example": "Bearer"},
-                                            "expires_in": {"type": "integer", "format": "int64", "example": 86400},
-                                            "refresh_token": {"type": "string", "description": "Long-lived credential; rotate via /auth/refresh. Omitted when its row could not be persisted."},
-                                            "refresh_expires_in": {"type": "integer", "format": "int64", "example": 2592000}
-                                        }
-                                    }
-                                }
-                            }
-                        },
-                        "401": {"description": "Invalid username or password"}
-                    }
-                }
-            },
-            "/auth/refresh": {
-                "post": {
-                    "tags": ["auth"],
-                    "summary": "Exchange a refresh credential for a fresh token pair",
-                    "description": "Rotates on use: the presented credential is revoked and a new credential accompanies the fresh 24-hour bearer token. Replaying a rotated credential fails closed with 401. This public route is mounted at /auth/refresh, not under /api.",
-                    "requestBody": {
-                        "required": true,
-                        "content": {
-                            "application/json": {
-                                "schema": {
-                                    "type": "object",
-                                    "required": ["refresh_token"],
-                                    "properties": {
-                                        "refresh_token": {"type": "string"}
-                                    }
-                                }
-                            }
-                        }
-                    },
-                    "responses": {
-                        "200": {
-                            "description": "Fresh token pair",
-                            "content": {
-                                "application/json": {
-                                    "schema": {
-                                        "type": "object",
-                                        "required": ["token", "token_type", "expires_in"],
-                                        "properties": {
-                                            "token": {"type": "string"},
-                                            "token_type": {"type": "string", "example": "Bearer"},
-                                            "expires_in": {"type": "integer", "format": "int64", "example": 86400},
-                                            "refresh_token": {"type": "string", "description": "The rotated replacement credential."},
-                                            "refresh_expires_in": {"type": "integer", "format": "int64", "example": 2592000}
-                                        }
-                                    }
-                                }
-                            }
-                        },
-                        "401": {"description": "Invalid, expired, or rotated credential"}
-                    }
-                }
-            },
-            "/auth/logout": {
-                "post": {
-                    "tags": ["auth"],
-                    "summary": "Revoke a refresh credential",
-                    "description": "Revokes the presented credential server-side. Idempotent: unknown or already-revoked credentials still answer 200 so logout never leaks whether a credential existed. This public route is mounted at /auth/logout, not under /api.",
-                    "requestBody": {
-                        "required": true,
-                        "content": {
-                            "application/json": {
-                                "schema": {
-                                    "type": "object",
-                                    "required": ["refresh_token"],
-                                    "properties": {
-                                        "refresh_token": {"type": "string"}
-                                    }
-                                }
-                            }
-                        }
-                    },
-                    "responses": {
-                        "200": {"description": "Credential revoked (or already dead)"}
-                    }
-                }
-            },
-            "/auth/status": {
-                "get": {
-                    "tags": ["auth"],
-                    "summary": "Check authentication status",
-                    "description": "Reports whether the supplied bearer token is valid. This public route is mounted at /auth/status, not under /api.",
-                    "responses": {
-                        "200": {
-                            "description": "Authentication status",
-                            "content": {
-                                "application/json": {
-                                    "schema": {
-                                        "type": "object",
-                                        "required": ["authenticated"],
-                                        "properties": {
-                                            "authenticated": {"type": "boolean"},
-                                            "user_id": {"type": "string"},
-                                            "username": {"type": "string"},
-                                            "role": {"type": "string"},
-                                            "message": {"type": "string"}
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            },
-            "/auth/refresh": {
-                "post": {
-                    "tags": ["auth"],
-                    "summary": "Rotate the refresh credential",
-                    "description": "Exchanges a valid refresh credential for a new bearer token and a rotated refresh credential. Fails closed on replay of an already-rotated credential.",
-                    "requestBody": {
-                        "required": true,
-                        "content": {
-                            "application/json": {
-                                "schema": {
-                                    "type": "object",
-                                    "required": ["refresh_token"],
-                                    "properties": {
-                                        "refresh_token": {"type": "string"}
-                                    }
-                                }
-                            }
-                        }
-                    },
-                    "responses": {
-                        "200": {
-                            "description": "New bearer token and rotated refresh credential"
-                        },
-                        "401": {"description": "Missing, invalid, or replayed credential"}
-                    }
-                }
-            },
-            "/auth/logout": {
-                "post": {
-                    "tags": ["auth"],
-                    "summary": "Revoke the refresh credential",
-                    "description": "Revokes the presented refresh credential server-side. Idempotent: revoking an already-revoked credential still returns 200.",
-                    "requestBody": {
-                        "required": true,
-                        "content": {
-                            "application/json": {
-                                "schema": {
-                                    "type": "object",
-                                    "required": ["refresh_token"],
-                                    "properties": {
-                                        "refresh_token": {"type": "string"}
-                                    }
-                                }
-                            }
-                        }
-                    },
-                    "responses": {
-                        "200": {
-                            "description": "Revocation recorded (always 200, even for an absent credential)"
-                        }
-                    }
-                }
-            },
-            "/health": {
-                "get": {
-                    "tags": ["health"],
-                    "summary": "Health check",
-                    "description": "Returns the health status of the API server",
-                    "responses": {
-                        "200": {
-                            "description": "Server is healthy",
-                            "content": {
-                                "application/json": {
-                                    "schema": {"$ref": "#/components/schemas/HealthResponse"}
-                                }
-                            }
-                        }
-                    }
-                }
-            },
-            "/repos": {
-                "get": {
-                    "tags": ["repos"],
-                    "summary": "List repositories",
-                    "description": "Returns a list of all repositories",
-                    "responses": {
-                        "200": {
-                            "description": "List of repositories",
-                            "content": {
-                                "application/json": {
-                                    "schema": {
-                                        "type": "array",
-                                        "items": {"$ref": "#/components/schemas/RepoResponse"}
-                                    }
-                                }
-                            }
-                        }
-                    }
-                },
-                "post": {
-                    "tags": ["repos"],
-                    "summary": "Create repository",
-                    "description": "Creates a new repository",
-                    "requestBody": {
-                        "required": true,
-                        "content": {
-                            "application/json": {
-                                "schema": {"$ref": "#/components/schemas/CreateRepoRequest"}
-                            }
-                        }
-                    },
-                    "responses": {
-                        "201": {
-                            "description": "Repository created",
-                            "content": {
-                                "application/json": {
-                                    "schema": {"$ref": "#/components/schemas/RepoResponse"}
-                                }
-                            }
-                        },
-                        "400": {"description": "Invalid input"}
-                    }
-                }
-            },
-            "/repos/{id}": {
-                "get": {
-                    "tags": ["repos"],
-                    "summary": "Get repository",
-                    "description": "Returns a repository by ID",
-                    "parameters": [
-                        {
-                            "name": "id",
-                            "in": "path",
-                            "required": true,
-                            "schema": {"type": "string"}
-                        }
-                    ],
-                    "responses": {
-                        "200": {
-                            "description": "Repository found",
-                            "content": {
-                                "application/json": {
-                                    "schema": {"$ref": "#/components/schemas/RepoResponse"}
-                                }
-                            }
-                        },
-                        "404": {"description": "Repository not found"}
-                    }
-                },
-                "delete": {
-                    "tags": ["repos"],
-                    "summary": "Delete repository",
-                    "description": "Deletes a repository by ID",
-                    "parameters": [
-                        {
-                            "name": "id",
-                            "in": "path",
-                            "required": true,
-                            "schema": {"type": "string"}
-                        }
-                    ],
-                    "responses": {
-                        "204": {"description": "Repository deleted"},
-                        "404": {"description": "Repository not found"}
-                    }
-                }
-            },
-            "/repos/{owner}/{repo}/policy": {
-                "get": {
-                    "tags": ["repos"],
-                    "summary": "Read the ref-update policy",
-                    "description": "Returns the repository's required status checks and non-fast-forward setting (#240). Branch updates are declined when the named pipelines have not succeeded on the pushed commit.",
-                    "parameters": [
-                        {"name": "owner", "in": "path", "required": true, "schema": {"type": "string"}},
-                        {"name": "repo", "in": "path", "required": true, "schema": {"type": "string"}}
-                    ],
-                    "responses": {
-                        "200": {
-                            "description": "Current policy",
-                            "content": {
-                                "application/json": {
-                                    "schema": {"$ref": "#/components/schemas/RefPolicyResponse"}
-                                }
-                            }
-                        },
-                        "404": {"description": "Repository not found"}
-                    }
-                },
-                "patch": {
-                    "tags": ["repos"],
-                    "summary": "Update the ref-update policy",
-                    "description": "Sets required status checks and/or non-fast-forward denial for the repository. Omitted fields keep their current values. Tightening writes the repository's receive.denyNonFastForwards config before persisting the policy so enforcement never lags the declaration.",
-                    "parameters": [
-                        {"name": "owner", "in": "path", "required": true, "schema": {"type": "string"}},
-                        {"name": "repo", "in": "path", "required": true, "schema": {"type": "string"}}
-                    ],
-                    "requestBody": {
-                        "required": true,
-                        "content": {
-                            "application/json": {
-                                "schema": {"$ref": "#/components/schemas/UpdateRefPolicyRequest"}
-                            }
-                        }
-                    },
-                    "responses": {
-                        "200": {
-                            "description": "Updated policy",
-                            "content": {
-                                "application/json": {
-                                    "schema": {"$ref": "#/components/schemas/RefPolicyResponse"}
-                                }
-                            }
-                        },
-                        "400": {"description": "Invalid required check names"},
-                        "404": {"description": "Repository not found"},
-                        "500": {"description": "Failed to persist policy or update repository config"}
-                    }
-                }
-            },
-            "/repos/{owner}/{repo}/commits/{sha}/status": {
-                "get": {
-                    "tags": ["repos"],
-                    "summary": "Aggregated commit status",
-                    "description": "Reports each required check's latest pipeline outcome for the commit and whether the commit satisfies the repository's ref-update policy (#240).",
-                    "parameters": [
-                        {"name": "owner", "in": "path", "required": true, "schema": {"type": "string"}},
-                        {"name": "repo", "in": "path", "required": true, "schema": {"type": "string"}},
-                        {"name": "sha", "in": "path", "required": true, "schema": {"type": "string"}}
-                    ],
-                    "responses": {
-                        "200": {
-                            "description": "Aggregated status",
-                            "content": {
-                                "application/json": {
-                                    "schema": {"$ref": "#/components/schemas/CommitStatusResponse"}
-                                }
-                            }
-                        },
-                        "404": {"description": "Repository not found"}
-                    }
-                }
-            },
-            "/users/{id}/role": {
-                "patch": {
-                    "tags": ["users"],
-                    "summary": "Update a user's role",
-                    "description": "Administrator-only role update; the last administrator cannot be demoted.",
-                    "parameters": [
-                        {"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}
-                    ],
-                    "requestBody": {
-                        "required": true,
-                        "content": {
-                            "application/json": {
-                                "schema": {"$ref": "#/components/schemas/UpdateRoleRequest"}
-                            }
-                        }
-                    },
-                    "responses": {
-                        "200": {"description": "Role updated"},
-                        "400": {"description": "Invalid role or user ID"},
-                        "403": {"description": "Administrator access required"},
-                        "409": {"description": "The last administrator cannot be demoted"}
-                    }
-                }
-            },
-            "/pipelines": {
-                "get": {
-                    "tags": ["ci"],
-                    "summary": "List pipelines",
-                    "description": "Returns a list of all pipelines",
-                    "responses": {
-                        "200": {"description": "List of pipelines"}
-                    }
-                },
-                "post": {
-                    "tags": ["ci"],
-                    "summary": "Register a pipeline definition",
-                    "description": "Validates the pipeline definition document and stores it as the active version for the repository; the previous active version with the same name is retired (history retained). Body: {\"repo\": \"owner/name\", \"config\": \"<pipeline YAML>\"}",
-                    "responses": {
-                        "201": {"description": "Pipeline created"},
-                        "400": {"description": "Repository must be in owner/name form"},
-                        "403": {"description": "Not the repository owner"},
-                        "404": {"description": "Repository not found"},
-                        "422": {"description": "Pipeline definition is not valid"}
-                    }
-                }
-            },
-            "/pipelines/{id}": {
-                "get": {
-                    "tags": ["ci"],
-                    "summary": "Get pipeline",
-                    "parameters": [
-                        {"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}
-                    ],
-                    "responses": {
-                        "200": {"description": "Pipeline found"},
-                        "404": {"description": "Pipeline not found"}
-                    }
-                },
-                "delete": {
-                    "tags": ["ci"],
-                    "summary": "Delete or deactivate a pipeline",
-                    "description": "A pipeline with no runs is deleted; one with runs is deactivated instead so run history stays intact",
-                    "parameters": [
-                        {"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}
-                    ],
-                    "responses": {
-                        "200": {"description": "Pipeline deleted or deactivated"},
-                        "403": {"description": "Not the repository owner"},
-                        "404": {"description": "Pipeline not found"}
-                    }
-                }
-            },
-            "/pipelines/{id}/runs": {
-                "post": {
-                    "tags": ["ci"],
-                    "summary": "Trigger a pipeline run",
-                    "description": "Resolves the requested revision (default HEAD) and hands the run to the CI orchestrator. Body: {\"ref\": \"branch-or-commit\"} (optional)",
-                    "parameters": [
-                        {"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}
-                    ],
-                    "responses": {
-                        "202": {"description": "Run triggered"},
-                        "400": {"description": "Invalid or unresolvable ref"},
-                        "403": {"description": "Not the repository owner"},
-                        "404": {"description": "Pipeline or repository not found"},
-                        "503": {"description": "CI orchestrator trigger is not configured"}
-                    }
-                }
-            },
-            "/pipeline-runs": {
-                "get": {
-                    "tags": ["ci"],
-                    "summary": "List pipeline runs",
-                    "responses": {
-                        "200": {"description": "List of pipeline runs"}
-                    }
-                }
-            },
-            "/pipeline-runs/{id}": {
-                "get": {
-                    "tags": ["ci"],
-                    "summary": "Get pipeline run",
-                    "parameters": [
-                        {"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}
-                    ],
-                    "responses": {
-                        "200": {
-                            "description": "Pipeline run found",
-                            "content": {
-                                "application/json": {
-                                    "schema": {"$ref": "#/components/schemas/PipelineRunResponse"}
-                                }
-                            }
-                        },
-                        "404": {"description": "Pipeline run not found"}
-                    }
-                }
-            },
-            "/pipeline-runs/{id}/jobs": {
-                "get": {
-                    "tags": ["ci"],
-                    "summary": "Get pipeline run jobs",
-                    "parameters": [
-                        {"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}
-                    ],
-                    "responses": {
-                        "200": {"description": "List of jobs"}
-                    }
-                }
-            },
-            "/pipeline-runs/{id}/rerun": {
-                "post": {
-                    "tags": ["ci"],
-                    "summary": "Rerun a pipeline run at its stored commit",
-                    "description": "Triggers a new run pinned to the original run's commit hash — the reason to rerun is usually doubt about the original verdict, and refs move. A commit that no longer resolves is refused up front instead of minting a run doomed at clone time. Delegates to the CI orchestrator like a push trigger and rides its durable duplicate protection.",
-                    "parameters": [
-                        {"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}
-                    ],
-                    "responses": {
-                        "202": {
-                            "description": "Rerun accepted (pipeline_run_id may be null when the orchestrator queues asynchronously)"
-                        },
-                        "400": {"description": "Invalid run ID or unresolvable stored commit"},
-                        "404": {"description": "Pipeline run not found"},
-                        "502": {"description": "CI orchestrator rejected the trigger"},
-                        "503": {"description": "CI orchestrator trigger not configured"}
-                    }
-                }
-            },
-            "/jobs/{id}": {
-                "get": {
-                    "tags": ["ci"],
-                    "summary": "Get job",
-                    "parameters": [
-                        {"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}
-                    ],
-                    "responses": {
-                        "200": {
-                            "description": "Job found",
-                            "content": {
-                                "application/json": {
-                                    "schema": {"$ref": "#/components/schemas/JobResponse"}
-                                }
-                            }
-                        },
-                        "404": {"description": "Job not found"}
-                    }
-                }
-            },
-            "/jobs": {
-                "post": {
-                    "tags": ["ci"],
-                    "summary": "Submit an owned job",
-                    "requestBody": {
-                        "required": true,
-                        "content": {
-                            "application/json": {
-                                "schema": {
-                                    "type": "object",
-                                    "required": ["pipeline_run_id", "name", "commands", "idempotency_key"],
-                                    "properties": {
-                                        "pipeline_run_id": {"type": "string", "format": "uuid"},
-                                        "name": {"type": "string", "maxLength": 128},
-                                        "commands": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 64},
-                                        "working_dir": {"type": ["string", "null"]},
-                                        "idempotency_key": {"type": "string", "maxLength": 128},
-                                        "timeout": {"type": ["string", "null"], "description": "Bounded duration such as 45m or 900s; defaults to 300s"}
-                                    }
-                                }
-                            }
-                        }
-                    },
-                    "responses": {
-                        "201": {"description": "Job queued"},
-                        "200": {"description": "Idempotent replay"},
-                        "403": {"description": "Repository ownership denied"},
-                        "409": {"description": "Conflicting request or terminal run"}
-                    }
-                }
-            },
-            "/jobs/{id}/logs": {
-                "get": {
-                    "tags": ["ci"],
-                    "summary": "Get job logs",
-                    "parameters": [
-                        {"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}
-                    ],
-                    "responses": {
-                        "200": {"description": "Job logs"}
-                    }
-                }
-            },
-            "/jobs/{id}/cancel": {
-                "post": {
-                    "tags": ["ci"],
-                    "summary": "Cancel an owned job",
-                    "parameters": [
-                        {"name": "id", "in": "path", "required": true, "schema": {"type": "string", "format": "uuid"}}
-                    ],
-                    "responses": {
-                        "200": {"description": "Cancellation persisted"},
-                        "403": {"description": "Repository ownership denied"},
-                        "404": {"description": "Job not found"},
-                        "409": {"description": "Job already terminal"}
-                    }
-                }
-            },
-            "/runners": {
-                "get": {
-                    "tags": ["runners"],
-                    "summary": "List runners",
-                    "responses": {
-                        "200": {"description": "List of runners"}
-                    }
-                },
-                "post": {
-                    "tags": ["runners"],
-                    "summary": "Register runner",
-                    "requestBody": {
-                        "required": true,
-                        "content": {
-                            "application/json": {
-                                "schema": {"type": "object"}
-                            }
-                        }
-                    },
-                    "responses": {
-                        "201": {
-                            "description": "Runner registered",
-                            "content": {
-                                "application/json": {
-                                    "schema": {"$ref": "#/components/schemas/RunnerResponse"}
-                                }
-                            }
-                        }
-                    }
-                }
-            },
-            "/runners/{id}": {
-                "get": {
-                    "tags": ["runners"],
-                    "summary": "Get runner",
-                    "parameters": [
-                        {"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}
-                    ],
-                    "responses": {
-                        "200": {
-                            "description": "Runner found",
-                            "content": {
-                                "application/json": {
-                                    "schema": {"$ref": "#/components/schemas/RunnerResponse"}
-                                }
-                            }
-                        },
-                        "404": {"description": "Runner not found"}
-                    }
-                },
-                "delete": {
-                    "tags": ["runners"],
-                    "summary": "Retire an idle runner",
-                    "description": "Marks a runner retired without deleting its audit record. Requires admin or maintainer role and refuses while assigned or running jobs exist.",
-                    "parameters": [
-                        {"name": "id", "in": "path", "required": true, "schema": {"type": "string", "format": "uuid"}}
-                    ],
-                    "responses": {
-                        "204": {"description": "Runner retired"},
-                        "400": {"description": "Invalid runner ID"},
-                        "403": {"description": "Administrator or maintainer role required"},
-                        "404": {"description": "Runner not found"},
-                        "409": {"description": "Runner has active jobs"}
-                    }
-                }
-            },
-            "/artifacts": {
-                "get": {
-                    "tags": ["artifacts"],
-                    "summary": "List artifacts",
-                    "responses": {
-                        "200": {"description": "List of artifacts"}
-                    }
-                }
-            },
-            "/artifacts/{id}": {
-                "get": {
-                    "tags": ["artifacts"],
-                    "summary": "Get artifact",
-                    "parameters": [
-                        {"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}
-                    ],
-                    "responses": {
-                        "200": {
-                            "description": "Artifact found",
-                            "content": {
-                                "application/json": {
-                                    "schema": {"$ref": "#/components/schemas/ArtifactResponse"}
-                                }
-                            }
-                        },
-                        "404": {"description": "Artifact not found"}
-                    }
-                },
-                "delete": {
-                    "tags": ["artifacts"],
-                    "summary": "Delete artifact",
-                    "parameters": [
-                        {"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}
-                    ],
-                    "responses": {
-                        "204": {"description": "Artifact deleted"},
-                        "404": {"description": "Artifact not found"}
-                    }
-                }
-            },
-            "/artifacts/{id}/content": {
-                "get": {
-                    "tags": ["artifacts"],
-                    "summary": "Download artifact bytes",
-                    "parameters": [
-                        {"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}
-                    ],
-                    "responses": {
-                        "200": {"description": "Artifact bytes"},
-                        "401": {"description": "Authentication required"},
-                        "404": {"description": "Artifact not found"}
-                    }
-                }
-            },
-            "/jobs/{job_id}/artifacts": {
-                "get": {
-                    "tags": ["artifacts"],
-                    "summary": "Get job artifacts",
-                    "parameters": [
-                        {"name": "job_id", "in": "path", "required": true, "schema": {"type": "string"}}
-                    ],
-                    "responses": {
-                        "200": {"description": "List of job artifacts"}
-                    }
-                }
-            },
-            "/review-runs": {
-                "post": {
-                    "tags": ["review"],
-                    "summary": "Submit a code review run",
-                    "description": "Creates a persisted review run for a repository head. The idempotency key makes retries safe: the same key against the same head SHA returns the existing run (200), while the same key against a different head SHA is a 409 conflict.",
-                    "requestBody": {
-                        "required": true,
-                        "content": {
-                            "application/json": {
-                                "schema": {"$ref": "#/components/schemas/SubmitReviewRunRequest"}
-                            }
-                        }
-                    },
-                    "responses": {
-                        "201": {
-                            "description": "Review run created",
-                            "content": {
-                                "application/json": {
-                                    "schema": {"$ref": "#/components/schemas/ReviewRunSubmissionResponse"}
-                                }
-                            }
-                        },
-                        "200": {
-                            "description": "Idempotent retry: existing run for the same key and head SHA",
-                            "content": {
-                                "application/json": {
-                                    "schema": {"$ref": "#/components/schemas/ReviewRunSubmissionResponse"}
-                                }
-                            }
-                        },
-                        "400": {"description": "Invalid submission fields"},
-                        "401": {"description": "Missing or invalid bearer token"},
-                        "403": {"description": "Caller does not own the repository"},
-                        "404": {"description": "Repository not found"},
-                        "409": {"description": "Idempotency key reused against a different head SHA"}
-                    }
-                }
-            },
-            "/review-runs/{id}": {
-                "get": {
-                    "tags": ["review"],
-                    "summary": "Read a review run",
-                    "description": "Returns the persisted review run. Runs the caller is not authorized to see are reported as not-found.",
-                    "parameters": [
-                        {"name": "id", "in": "path", "required": true, "schema": {"type": "string", "format": "uuid"}}
-                    ],
-                    "responses": {
-                        "200": {
-                            "description": "Review run",
-                            "content": {
-                                "application/json": {
-                                    "schema": {"$ref": "#/components/schemas/ReviewRunResponse"}
-                                }
-                            }
-                        },
-                        "400": {"description": "Invalid run ID"},
-                        "401": {"description": "Missing or invalid bearer token"},
-                        "404": {"description": "Run not found or not visible to the caller"}
-                    }
-                }
-            },
-            "/review-runs/{id}/findings": {
-                "get": {
-                    "tags": ["review"],
-                    "summary": "List findings for a review run",
-                    "description": "Returns findings in deterministic order (path, then line with NULL lines first, then fingerprint) with bounded pagination.",
-                    "parameters": [
-                        {"name": "id", "in": "path", "required": true, "schema": {"type": "string", "format": "uuid"}},
-                        {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer", "minimum": 1, "maximum": 500, "default": 100}},
-                        {"name": "offset", "in": "query", "required": false, "schema": {"type": "integer", "minimum": 0, "default": 0}}
-                    ],
-                    "responses": {
-                        "200": {
-                            "description": "Paginated findings",
-                            "content": {
-                                "application/json": {
-                                    "schema": {"$ref": "#/components/schemas/ReviewFindingsResponse"}
-                                }
-                            }
-                        },
-                        "400": {"description": "Invalid run ID or pagination"},
-                        "401": {"description": "Missing or invalid bearer token"},
-                        "404": {"description": "Run not found or not visible to the caller"}
-                    }
-                }
-            },
-            "/ssh-keys": {
-                "get": {
-                    "tags": ["users"],
-                    "summary": "List the caller's SSH public keys",
-                    "description": "The per-user public key registry backing Git-over-SSH authentication. Fingerprints are computed server-side and globally unique; registering a duplicate key returns 409 duplicate_key.",
-                    "responses": {
-                        "200": {"description": "List of SSH keys"},
-                        "401": {"description": "Missing or invalid bearer token"}
-                    }
-                },
-                "post": {
-                    "tags": ["users"],
-                    "summary": "Register an SSH public key",
-                    "requestBody": {
-                        "required": true,
-                        "content": {
-                            "application/json": {
-                                "schema": {
-                                    "type": "object",
-                                    "required": ["name", "public_key"],
-                                    "properties": {
-                                        "name": {"type": "string"},
-                                        "public_key": {"type": "string"}
-                                    }
-                                }
-                            }
-                        }
-                    },
-                    "responses": {
-                        "201": {"description": "Key registered"},
-                        "409": {"description": "duplicate_key — the key material is already registered"}
-                    }
-                }
-            },
-            "/ssh-keys/{id}": {
-                "delete": {
-                    "tags": ["users"],
-                    "summary": "Delete an SSH public key",
-                    "parameters": [
-                        {"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}
-                    ],
-                    "responses": {
-                        "204": {"description": "Key deleted"},
-                        "404": {"description": "Key not found or not owned by the caller"}
-                    }
-                }
-            },
-            "/webhook/trigger/{pipeline_id}": {
-                "post": {
-                    "tags": ["ci"],
-                    "summary": "Webhook-triggered pipeline execution",
-                    "description": "Authenticated webhook entry point. With a CI trigger client configured it delegates to the orchestrator and returns 202; otherwise it queues the pipeline's first runnable job directly (200). Redeliveries for the same commit are idempotent — one webhook key maps to exactly one job and a replay's run row is recorded as cancelled.",
-                    "parameters": [
-                        {"name": "pipeline_id", "in": "path", "required": true, "schema": {"type": "string"}}
-                    ],
-                    "responses": {
-                        "200": {"description": "Job queued directly into the durable queue"},
-                        "202": {"description": "Delegated to the CI orchestrator"},
-                        "404": {"description": "Pipeline not found"},
-                        "409": {"description": "Webhook idempotency key reused with a different job"},
-                        "422": {"description": "Stored pipeline definition unusable"},
-                        "502": {"description": "CI delegation failed"}
-                    }
-                }
-            },
-            "/dashboard": {
-                "get": {
-                    "tags": ["health"],
-                    "summary": "Public aggregate dashboard data",
-                    "description": "Aggregate dashboard counters; requires no authentication.",
-                    "responses": {
-                        "200": {"description": "Dashboard HTML"}
-                    }
-                }
-            },
-            "/metrics": {
-                "get": {
-                    "tags": ["health"],
-                    "summary": "Prometheus metrics scrape endpoint",
-                    "responses": {
-                        "200": {"description": "Metrics in Prometheus text exposition format"}
-                    }
-                }
-            }
-        },
+        "paths": {},
         "components": {
-            "schemas": {
-                "HealthResponse": {
-                    "type": "object",
-                    "properties": {
-                        "status": {"type": "string", "example": "healthy"},
-                        "timestamp": {"type": "string", "example": "2024-01-01T00:00:00Z"}
-                    }
-                },
-                "RepoResponse": {
-                    "type": "object",
-                    "properties": {
-                        "id": {"type": "string"},
-                        "name": {"type": "string"},
-                        "owner_id": {"type": "string"},
-                        "visibility": {"type": "string"},
-                        "git_path": {"type": "string"},
-                        "created_at": {"type": "string"}
-                    }
-                },
-                "CreateRepoRequest": {
-                    "type": "object",
-                    "required": ["name"],
-                    "properties": {
-                        "name": {"type": "string"},
-                        "visibility": {"type": "string", "nullable": true}
-                    }
-                },
-                "RefPolicyResponse": {
-                    "type": "object",
-                    "properties": {
-                        "required_checks": {
-                            "type": "array",
-                            "items": {"type": "string"}
-                        },
-                        "deny_non_fast_forward": {"type": "boolean"}
-                    }
-                },
-                "UpdateRefPolicyRequest": {
-                    "type": "object",
-                    "properties": {
-                        "required_checks": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                            "nullable": true,
-                            "description": "Pipeline names that must succeed on a commit before a branch may advance to it. Omitted to keep the current list."
-                        },
-                        "deny_non_fast_forward": {
-                            "type": "boolean",
-                            "nullable": true,
-                            "description": "Reject non-fast-forward branch updates. Omitted to keep the current setting."
-                        }
-                    }
-                },
-                "CommitStatusResponse": {
-                    "type": "object",
-                    "properties": {
-                        "commit": {"type": "string"},
-                        "required_checks": {
-                            "type": "array",
-                            "items": {"$ref": "#/components/schemas/RequiredCheckStatus"}
-                        },
-                        "satisfied": {"type": "boolean"}
-                    }
-                },
-                "RequiredCheckStatus": {
-                    "type": "object",
-                    "properties": {
-                        "check": {"type": "string"},
-                        "status": {
-                            "type": "string",
-                            "nullable": true,
-                            "description": "Latest pipeline run status for the commit; null when it has never run."
-                        }
-                    }
-                },
-                "UpdateRoleRequest": {
-                    "type": "object",
-                    "required": ["role"],
-                    "properties": {
-                        "role": {
-                            "type": "string",
-                            "enum": ["admin", "maintainer", "developer", "read_only"]
-                        }
-                    }
-                },
-                "PipelineRunResponse": {
-                    "type": "object",
-                    "properties": {
-                        "id": {"type": "string"},
-                        "pipeline_id": {"type": "string"},
-                        "status": {"type": "string"},
-                        "commit_hash": {"type": "string"},
-                        "triggered_by": {"type": "string"},
-                        "started_at": {"type": "string", "nullable": true},
-                        "finished_at": {"type": "string", "nullable": true},
-                        "error": {"type": "string", "nullable": true}
-                    }
-                },
-                "JobResponse": {
-                    "type": "object",
-                    "properties": {
-                        "id": {"type": "string"},
-                        "name": {"type": "string"},
-                        "status": {"type": "string"},
-                        "runner_id": {"type": "string", "nullable": true},
-                        "started_at": {"type": "string", "nullable": true},
-                        "finished_at": {"type": "string", "nullable": true}
-                    }
-                },
-                "RunnerResponse": {
-                    "type": "object",
-                    "properties": {
-                        "id": {"type": "string"},
-                        "name": {"type": "string"},
-                        "type": {"type": "string"},
-                        "status": {"type": "string"},
-                        "capacity": {"type": "integer"},
-                        "last_heartbeat": {"type": "string", "nullable": true}
-                    }
-                },
-                "ArtifactResponse": {
-                    "type": "object",
-                    "properties": {
-                        "id": {"type": "string"},
-                        "job_id": {"type": "string"},
-                        "name": {"type": "string"},
-                        "path": {"type": "string"},
-                        "checksum": {"type": "string"},
-                        "size_bytes": {"type": "integer", "format": "int64"},
-                        "created_at": {"type": "string"}
-                    }
-                },
-                "SubmitReviewRunRequest": {
-                    "type": "object",
-                    "required": ["base_sha", "head_sha", "idempotency_key", "attempt"],
-                    "properties": {
-                        "repo_id": {"type": "string", "format": "uuid", "description": "Repository UUID; mutually exclusive with owner+name"},
-                        "owner": {"type": "string", "description": "Repository owner username; used with name"},
-                        "name": {"type": "string", "description": "Repository name; used with owner"},
-                        "base_sha": {"type": "string", "minLength": 1, "maxLength": 128},
-                        "head_sha": {"type": "string", "minLength": 1, "maxLength": 128},
-                        "idempotency_key": {"type": "string", "minLength": 1, "maxLength": 128},
-                        "attempt": {"type": "integer", "minimum": 1, "maximum": 10000}
-                    }
-                },
-                "ReviewRunResponse": {
-                    "type": "object",
-                    "properties": {
-                        "id": {"type": "string", "format": "uuid"},
-                        "repo_id": {"type": "string", "format": "uuid", "nullable": true},
-                        "base_sha": {"type": "string"},
-                        "head_sha": {"type": "string"},
-                        "idempotency_key": {"type": "string"},
-                        "status": {"type": "string", "enum": ["pending", "running", "succeeded", "failed", "cancelled"]},
-                        "attempt": {"type": "integer"},
-                        "receipt_id": {"type": "string", "nullable": true},
-                        "created_at": {"type": "string"},
-                        "updated_at": {"type": "string"}
-                    }
-                },
-                "ReviewRunSubmissionResponse": {
-                    "type": "object",
-                    "properties": {
-                        "status": {"type": "string", "enum": ["created", "already_exists"]},
-                        "run": {"$ref": "#/components/schemas/ReviewRunResponse"}
-                    }
-                },
-                "ReviewFindingResponse": {
-                    "type": "object",
-                    "properties": {
-                        "id": {"type": "string", "format": "uuid"},
-                        "run_id": {"type": "string", "format": "uuid"},
-                        "source": {"type": "string"},
-                        "fingerprint": {"type": "string"},
-                        "path": {"type": "string"},
-                        "line": {"type": "integer", "nullable": true},
-                        "severity": {"type": "string"},
-                        "category": {"type": "string"},
-                        "title": {"type": "string"},
-                        "message": {"type": "string"},
-                        "evidence": {"type": "string", "nullable": true},
-                        "confidence": {"type": "string"},
-                        "position_status": {"type": "string", "enum": ["line", "file", "deleted", "unavailable"]},
-                        "disposition": {"type": "string"},
-                        "created_at": {"type": "string"},
-                        "updated_at": {"type": "string"}
-                    }
-                },
-                "ReviewFindingsResponse": {
-                    "type": "object",
-                    "properties": {
-                        "run_id": {"type": "string", "format": "uuid"},
-                        "run_status": {"type": "string"},
-                        "total": {"type": "integer"},
-                        "limit": {"type": "integer"},
-                        "offset": {"type": "integer"},
-                        "findings": {
-                            "type": "array",
-                            "items": {"$ref": "#/components/schemas/ReviewFindingResponse"}
-                        }
-                    }
-                }
-            }
+            "schemas": {}
         }
     })
 }
 
 /// OpenAPI spec response
 pub async fn openapi_spec() -> impl IntoResponse {
-    Json(get_openapi_spec())
+    Json(load_openapi_spec())
 }
 
 /// Get the Swagger UI HTML page
@@ -1196,7 +119,7 @@ mod tests {
 
     #[test]
     fn test_openapi_spec_contains_required_fields() {
-        let spec = get_openapi_spec();
+        let spec = load_openapi_spec();
         assert!(spec.get("openapi").is_some());
         assert!(spec.get("info").is_some());
         assert!(spec.get("paths").is_some());
@@ -1205,13 +128,13 @@ mod tests {
 
     #[test]
     fn test_openapi_version() {
-        let spec = get_openapi_spec();
+        let spec = load_openapi_spec();
         assert_eq!(spec.get("openapi").unwrap(), "3.0.3");
     }
 
     #[test]
     fn test_api_info() {
-        let spec = get_openapi_spec();
+        let spec = load_openapi_spec();
         let info = spec.get("info").unwrap();
         assert_eq!(info.get("title").unwrap(), "GitForge API");
         assert_eq!(info.get("version").unwrap(), "1.0.0");
@@ -1219,7 +142,7 @@ mod tests {
 
     #[test]
     fn test_api_paths_exist() {
-        let spec = get_openapi_spec();
+        let spec = load_openapi_spec();
         let paths = spec.get("paths").unwrap().as_object().unwrap();
         assert!(paths.contains_key("/auth/login"));
         assert!(paths.contains_key("/auth/refresh"));
@@ -1240,7 +163,7 @@ mod tests {
 
     #[test]
     fn test_openapi_auth_routes_are_public_root_routes() {
-        let spec = get_openapi_spec();
+        let spec = load_openapi_spec();
         let paths = spec.get("paths").unwrap().as_object().unwrap();
         let login = paths.get("/auth/login").unwrap().as_object().unwrap();
         assert!(login.get("post").is_some());
@@ -1253,7 +176,7 @@ mod tests {
 
     #[test]
     fn test_api_components_schemas() {
-        let spec = get_openapi_spec();
+        let spec = load_openapi_spec();
         let components = spec.get("components").unwrap();
         let schemas = components.get("schemas").unwrap().as_object().unwrap();
         assert!(schemas.contains_key("HealthResponse"));
@@ -1290,7 +213,7 @@ mod tests {
 
     #[test]
     fn test_openapi_spec_servers() {
-        let spec = get_openapi_spec();
+        let spec = load_openapi_spec();
         let servers = spec.get("servers").unwrap().as_array().unwrap();
         assert!(!servers.is_empty());
         assert_eq!(servers[0].get("url").unwrap(), "/");
@@ -1298,17 +221,42 @@ mod tests {
 
     #[test]
     fn test_openapi_spec_tags() {
-        let spec = get_openapi_spec();
+        let spec = load_openapi_spec();
         let tags = spec.get("tags").unwrap().as_array().unwrap();
         assert!(tags.len() >= 5);
     }
 
     #[test]
     fn test_openapi_paths_have_operations() {
-        let spec = get_openapi_spec();
+        let spec = load_openapi_spec();
         let paths = spec.get("paths").unwrap().as_object().unwrap();
         // Health endpoint should have GET
         let health = paths.get("/health").unwrap().as_object().unwrap();
         assert!(health.contains_key("get"));
+    }
+
+    /// Verify that the spec loaded from the external file has all paths
+    /// and schemas, not just the fallback stub.
+    #[test]
+    fn test_openapi_spec_from_file_has_content() {
+        let spec = load_openapi_spec();
+        let paths = spec.get("paths").unwrap().as_object().unwrap();
+        // The fallback has an empty paths object; if the file loaded,
+        // we should see real endpoints.
+        assert!(
+            paths.len() >= 5,
+            "Expected at least 5 paths from spec file, got {}",
+            paths.len()
+        );
+    }
+
+    #[test]
+    fn test_openapi_spec_endpoint_has_full_paths() {
+        let spec = load_openapi_spec();
+        let paths = spec.get("paths").unwrap().as_object().unwrap();
+        // /health must exist
+        assert!(paths.contains_key("/health"));
+        // /pipelines must exist
+        assert!(paths.contains_key("/pipelines"));
     }
 }

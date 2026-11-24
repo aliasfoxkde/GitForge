@@ -43,6 +43,10 @@ struct Cli {
     #[arg(long)]
     shutdown: bool,
 
+    /// Print captured stdout/stderr after successful jobs
+    #[arg(long)]
+    show_output: bool,
+
     /// cargo command and arguments (e.g., "test --workspace"); options after
     /// the cargo command are forwarded without requiring a second `--`.
     #[arg(trailing_var_arg = true)]
@@ -115,8 +119,10 @@ pub async fn run_with_client<C: JobSubmitter>(client: &C) -> Result<()> {
                             || status.starts_with("failed")
                             || status == "cancelled"
                         {
-                            if job_failed(&status) {
+                            if job_failed(&status) || cli.show_output {
                                 print_job_output(client, &socket_path, &job_id).await;
+                            }
+                            if job_failed(&status) {
                                 anyhow::bail!("job {status}");
                             }
                             return Ok(());
@@ -501,6 +507,20 @@ mod tests {
     fn test_cli_parse_no_wait() {
         let cli = Cli::try_parse_from(["gitforge-build", "-n", "--", "build"]).unwrap();
         assert!(cli.no_wait);
+    }
+
+    #[test]
+    fn test_cli_parse_show_output() {
+        let cli = Cli::try_parse_from([
+            "gitforge-build",
+            "--show-output",
+            "test",
+            "-p",
+            "gitforge-scheduler",
+        ])
+        .unwrap();
+        assert!(cli.show_output);
+        assert_eq!(cli.cargo_args, vec!["test", "-p", "gitforge-scheduler"]);
     }
 
     #[test]

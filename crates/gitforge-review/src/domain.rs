@@ -206,7 +206,7 @@ impl FromStr for PositionStatus {
 /// 16-hex-character fingerprint, enabling deduplication across retried runs
 /// on the same head SHA. See the module docs for the canonical encoding.
 pub fn finding_fingerprint(file: &str, line: Option<u32>, rule: &str, message: &str) -> String {
-    let line_str = line.map(|l| l.to_string()).unwrap_or_default();
+    let line_str = line.map_or_default(|l| l.to_string());
     let mut hasher = Sha256::new();
     for field in [file, line_str.as_str(), rule, message] {
         let bytes = field.as_bytes();

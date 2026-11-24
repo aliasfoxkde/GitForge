@@ -31,4 +31,17 @@ if ! bash "$REPO_ROOT/scripts/gitforge-quick-check.sh"; then
     exit 1
 fi
 
+# Advisory branch/commit hygiene. Never blocks the push — it reports a
+# dirty tree, a non-kebab branch name, or commits that miss the
+# conventional-commit format this repo documents in CLAUDE.md.
+#
+# The commit range is the upstream tracking ref against HEAD. Git's own
+# pre-push arguments ($1=remote ref, $2=local ref) name the same branch
+# for an ordinary push, so `git log $1..$2` would compare a ref with
+# itself and check nothing.
+UPSTREAM="$(git rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || true)"
+if [ -n "$UPSTREAM" ]; then
+    bash "$REPO_ROOT/.githooks/pre-push.d/20-clean-branch" "$UPSTREAM" HEAD || true
+fi
+
 INFO "Pre-push checks passed — pushing..."

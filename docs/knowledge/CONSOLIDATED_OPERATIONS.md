@@ -140,9 +140,10 @@ Source: docs/RUNBOOK.md line 168 (`GITFORGE_CACHE_ROOT`); the
 - The runner bind-mounts `<GITFORGE_CACHE_ROOT>/cargo/<image>` at the
   job's `mount_path`; default `~/.cache/gitforge`, fallback
   `/var/cache/gitforge` when `$HOME` is unset
-  (crates/gitforge-runner/src/agent.rs:2756).
-- A cache that cannot be prepared is skipped with a warning; jobs run
-  cold (RUNBOOK line 168).
+  (crates/gitforge-common/src/volume.rs, `cache_root_with`).
+- A mount that cannot be prepared fails the job; the runner reports it
+  as an infrastructure failure, so the reason lands in the job's own
+  result (RUNBOOK line 171).
 - **Rollout gate**: a runner binary older than the feature silently
   ignores the `volumes` field (serde drops unknown fields,
   crates/gitforge-common/src/volume.rs:35-40), so a green run proves

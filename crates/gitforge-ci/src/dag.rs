@@ -18,6 +18,8 @@ pub struct JobNode {
 pub struct JobGraph {
     pub nodes: Vec<JobNode>,
     pub run_id: PipelineRunId,
+    /// Reverse adjacency index: JobId -> list of JobIds that depend on it
+    pub children: HashMap<JobId, Vec<JobId>>,
 }
 
 impl JobGraph {
@@ -185,13 +187,36 @@ impl DagBuilder {
             node.dependencies = dep_ids;
         }
 
-        let graph = JobGraph { nodes, run_id };
+        // Build reverse adjacency index (children map) for O(1) dependant lookups.
+        // Also populate children for each node during construction.
+        let mut children: HashMap<JobId, Vec<JobId>> = HashMap::new();
+        for node in &nodes {
+            for dep_id in &node.dependencies {
+                children.entry(*dep_id).or_default().push(node.id);
+            }
+        }
+
+        let graph = JobGraph {
+            nodes,
+            run_id,
+            children,
+        };
 
         // Validate no cycles
         if graph.has_cycle() {
             return Err(gitforge_common::Error::invalid_input(
                 "pipeline contains circular dependencies",
             ));
+        }
+
+        // Cap pipeline depth to prevent DoS from deeply-nested DAGs.
+        // A 1000-deep pipeline with fan-out would create millions of jobs.
+        const MAX_PIPELINE_DEPTH: usize = 100;
+        let depth = Self::max_depth(&graph);
+        if depth > MAX_PIPELINE_DEPTH {
+            return Err(gitforge_common::Error::invalid_input(format!(
+                "pipeline depth {depth} exceeds limit of {MAX_PIPELINE_DEPTH}",
+            )));
         }
 
         Ok(graph)
@@ -261,7 +286,6 @@ mod tests {
                 condition: None,
             }],
             timeout: None,
-            retry: None,
             skip_if: None,
             volumes: Vec::new(),
             cache: None,
@@ -352,6 +376,37 @@ mod tests {
             definition.env.get("CI_JOB_ONLY").map(String::as_str),
             Some("job")
         );
+    }
+
+    #[test]
+    fn test_push_base_reaches_every_job() {
+        // The push base is published through the pipeline `environment`
+        // map, so the DAG builder is what carries it into every job — a
+        // job that never receives it cannot diff against the push.
+        let pipeline = PipelineDefinition {
+            name: "test".to_string(),
+            version: "1.0".to_string(),
+            trigger_on: vec![],
+            environment: HashMap::new(),
+            jobs: vec![
+                make_job("detect-changes", vec![]),
+                make_job("clippy", vec![]),
+            ],
+        };
+
+        let augmented = crate::pipeline::with_push_base(&pipeline, Some("abc123"));
+        let run_id = gitforge_common::PipelineRunId::new();
+        let graph = DagBuilder::build(&augmented, run_id).unwrap();
+
+        assert_eq!(graph.nodes.len(), 2);
+        for node in &graph.nodes {
+            assert_eq!(
+                node.definition.env.get(crate::pipeline::PUSH_BASE_ENV),
+                Some(&"abc123".to_string()),
+                "job {} must carry the push base",
+                node.name
+            );
+        }
     }
 
     #[test]

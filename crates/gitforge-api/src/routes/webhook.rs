@@ -52,6 +52,27 @@ pub struct WebhookTriggerPayload {
 }
 
 /// Webhook trigger response
+impl WebhookTriggerPayload {
+    /// Validate the webhook payload. Returns an error string if the payload
+    /// is malformed. Call this after deserialization.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.commit_hash.is_empty() || self.commit_hash.len() > 256 {
+            return Err("commit_hash: must be 1-256 characters".to_string());
+        }
+        if self.branch.len() > 256 {
+            return Err("branch: must be 1-256 characters".to_string());
+        }
+        // Reject obviously invalid SHA-1/SHA-256 hex strings
+        if self.commit_hash.len() != 40
+            && self.commit_hash.len() != 64
+            && !self.commit_hash.chars().all(|c| c.is_ascii_hexdigit())
+        {
+            return Err("commit_hash: must be valid hex (40 or 64 chars)".to_string());
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct WebhookTriggerResponse {
     pub success: bool,
@@ -217,6 +238,18 @@ async fn trigger_pipeline(
     Path(pipeline_id): Path<String>,
     Json(payload): Json<WebhookTriggerPayload>,
 ) -> impl IntoResponse {
+    // Validate webhook payload before processing
+    if let Err(e) = payload.validate() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(WebhookTriggerResponse {
+                success: false,
+                message: format!("Invalid payload: {}", e),
+                pipeline_id: None,
+            }),
+        )
+            .into_response();
+    }
     tracing::info!(
         "Webhook trigger for pipeline {} from repo {}",
         pipeline_id,
@@ -301,8 +334,7 @@ async fn trigger_pipeline(
                                     payload.branch,
                                     run_id
                                         .as_deref()
-                                        .map(|id| format!(" (run {id})"))
-                                        .unwrap_or_default()
+                                        .map_or_default(|id| format!(" (run {id})"))
                                 ),
                                 pipeline_id: Some(pipeline_id),
                             }),

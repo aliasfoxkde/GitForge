@@ -7,33 +7,45 @@
 # same chain an operator runs by hand, executed mechanically.
 #
 # Default mode is a dry-run report: what is promoted now, what would change,
-# whether the runners are busy. Acting requires --apply (or AUTO_UPDATE=1,
+# whether any job is in flight. Acting requires --apply (or AUTO_UPDATE=1,
 # which is how the systemd timer opt-in works). Two safety gates sit in
 # front of any action:
 #   - a bundle must pass gitforge-release-verify (binaries, manifest, READY)
-#   - ci/runner are only restarted when no `gitforce-job-*` container is
-#     running; a busy fleet defers the whole cutover to the next pass
-#     (pending-only runs are just queued work — restarting ci mid-flight is
+#   - ci/runner are only restarted when the authoritative store reports no
+#     job in flight; a busy fleet defers the whole cutover to the next pass
+#     (queued-only work is just queued work — restarting ci mid-flight is
 #     the heartbeat-loss incident class, not a maintenance no-op)
 #
-# Usage: gitforge-release-auto [--apply]
+# The busy signal is the store's job rows, read by gitforge-release-busy —
+# NOT the runner's container names. The runner keeps a warm pool of
+# containers that have no job row at all, so counting containers is
+# permanently non-zero and defers every cutover forever (GF-16).
+#
+# Usage: gitforge-release-auto [--apply|--print-restart-plan]
+#   --print-restart-plan  print the units this pass would restart, as this
+#                          host's unit state sees them, and exit
 # Environment:
 #   GITFORGE_AUTO_REPO     checkout root (default: derived from this script)
 #   GITFORGE_AUTO_API      api health URL (default http://localhost:42780)
 #   GITFORGE_AUTO_WAIT     seconds to wait for post-restart health (default 60)
+#   GITFORGE_RELEASE_DB    database the busy gate reads (default: the live
+#                          database, resolved the way the release gate
+#                          resolves it)
 # Exit codes: 0 nothing to do / updated / deferred cleanly, 1 real failure.
 set -u -o pipefail
 
 apply=0
+plan_only=0
 case "${1:-}" in
     "") ;;
     --apply) apply=1 ;;
+    --print-restart-plan) plan_only=1 ;;
     -h|--help)
-        sed -n '2,28p' "$0"
+        awk 'NR>1 && /^#/ {print} NR>1 && !/^#/ {exit}' "$0"
         exit 0
         ;;
     *)
-        printf 'usage: gitforge-release-auto [--apply]\n' >&2
+        printf 'usage: gitforge-release-auto [--apply|--print-restart-plan]\n' >&2
         exit 64
         ;;
 esac
@@ -56,8 +68,12 @@ die() { printf 'release-auto: %s\n' "$1" >&2; exit 1; }
 # restart set is what the host actually runs. Failing the whole cutover on
 # a masked unit made every promote roll back forever (2026-10-10: the NAS
 # runner was retired via mask when CI moved to the fedora host).
+# A masked TEMPLATE INSTANCE is invisible to list-unit-files (it enumerates
+# unit files, not instances), so the retired-component check fell through and
+# the cutover tried to restart a masked unit. LoadState is the unit's own
+# state and reports "masked" for concrete units and instances alike.
 unit_masked() {
-    [[ "$(systemctl list-unit-files "$1" --no-legend 2>/dev/null | awk '{print $2}')" == "masked" ]]
+    [[ "$(systemctl show "$1" -p LoadState --value 2>/dev/null)" == "masked" ]]
 }
 RESTART_STATELESS=()
 for u in gitforge@api.service gitforge@git-server.service; do
@@ -76,6 +92,14 @@ for u in gitforge@ci.service gitforge@runner.service; do
     fi
 done
 restart_list() { [[ "${#@}" -gt 0 ]] && printf '%s ' "$@" || printf '(none)'; }
+
+# The restart plan as this host sees it. A masked unit is a retired
+# component, so it is excluded; the plan is what the operator (or the
+# regression test) can check against the host's own unit state.
+if [[ "$plan_only" -eq 1 ]]; then
+    say "restart plan: stateless=$(restart_list "${RESTART_STATELESS[@]}") scheduled=$(restart_list "${RESTART_SCHED[@]}")"
+    exit 0
+fi
 
 # One cutover at a time, across operators and timer ticks.
 mkdir -p "$releases_dir"
@@ -135,13 +159,27 @@ if [[ -z "$candidate" ]]; then
     exit 0
 fi
 
-# Runners busy? Any live `gitforce-job-*` container defers the cutover.
-job_containers=$(docker ps -q --filter "name=gitforce-job-" 2>/dev/null | wc -l)
+# Runners busy? The authoritative store decides, not the container names:
+# the runner keeps a warm pool of containers that have no job row, so a
+# container count is permanently non-zero and defers every cutover forever
+# (GF-16). gitforge-release-busy counts job rows that are `assigned` or
+# `running` AND still inside the fence grace window, which is the same
+# liveness term the scheduler uses to decide whether a row is alive — so a
+# row left behind by a dead runner cannot wedge this gate.
+#
+# An unreadable store fails closed: the cutover is refused, never started
+# blind on an unknown busy state. That is a real failure, not a clean
+# deferral — a silently unreadable store would stall the channel forever
+# with no signal.
+if ! inflight=$("$script_dir/gitforge-release-busy"); then
+    die "cannot read the in-flight job count from the store; the cutover is deferred until the store is readable"
+fi
+[[ "$inflight" =~ ^[0-9]+$ ]] || die "unexpected in-flight job count: '$inflight'"
 
-say "promoted=$promoted_id candidate=$candidate_id apply=$apply job_containers=$job_containers"
+say "promoted=$promoted_id candidate=$candidate_id apply=$apply inflight=$inflight"
 
-if [[ "$job_containers" -gt 0 ]]; then
-    say "deferred: $job_containers job container(s) running; retry on the next pass"
+if [[ "$inflight" -gt 0 ]]; then
+    say "deferred: $inflight job(s) in flight; retry on the next pass"
     exit 0
 fi
 

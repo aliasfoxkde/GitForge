@@ -5,10 +5,10 @@ Builds a throwaway SQLite fixture holding the pipelines / pipeline_runs /
 jobs tables the gate reads, then exercises the gate end to end under both
 evidence readers:
 
-- the sqlite3 CLI path, via a faithful PATH shim of the one invocation the
-  gate is allowed to make: `-batch -readonly <db> ".timeout 15000" <sql>`
-  in list mode. The shim refuses any other argv, so every CLI-path test
-  transitively pins the read-only and busy-timeout wiring;
+- the sqlite3 CLI path, via a faithful PATH shim of the read-only capability
+  probe and query invocation: `-batch -readonly :memory: "SELECT 1;"`, then
+  `-batch -readonly <db> ".timeout 15000" <sql>` in list mode. The shim
+  refuses any other argv, pinning compatibility and query wiring;
 - the python3 sqlite3 fallback path, forced by a hermetic PATH that
   carries no sqlite3 at all (the natural mode on hosts like Fedora that
   ship the sqlite3 module without the CLI);
@@ -64,6 +64,24 @@ EXPECTED_GREEN_STDOUT = (
     "(succeeded or skipped) covering the persisted definition\n"
 )
 
+
+def _has_usable_sqlite3_cli():
+    """Return true only when PATH's sqlite3 supports the expected CLI mode."""
+    executable = shutil.which("sqlite3")
+    if executable is None:
+        return False
+    try:
+        result = subprocess.run(
+            [executable, "-batch", "-readonly", ":memory:", "SELECT 1;"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0 and result.stdout.strip() == "1"
+
 DEF_JOBS = (
     {
         "name": "fmt",
@@ -112,13 +130,16 @@ CREATE TABLE jobs (
 # as empty — and refuses anything else with a loud exit code, so a gate
 # regression in the CLI wiring fails every CLI-path test.
 SQLITE3_SHIM = '''#!/usr/bin/env python3
-"""Test shim emulating the sqlite3 CLI invocation the release gate uses."""
+"""Test shim emulating the sqlite3 CLI calls the release gate uses."""
 import os
 import sqlite3
 import sys
 from urllib.parse import quote
 
 args = sys.argv[1:]
+if args == ["-batch", "-readonly", ":memory:", "SELECT 1;"]:
+    print("1")
+    sys.exit(0)
 if (
     len(args) != 5
     or args[0] != "-batch"
@@ -160,10 +181,10 @@ class ReleaseGateContractTests(unittest.TestCase):
 
         sqlite3_mode selects what `sqlite3` on that PATH is:
 
-        - "shim": the executable CLI shim (the gate's CLI path). The shim
-          refuses any argv beyond the one invocation the gate is allowed
-          to make, so every CLI-path test transitively pins the
-          read-only and busy-timeout wiring;
+        - "shim": an executable CLI shim that only permits the read-only
+          capability probe and expected query invocation;
+        - "broken": an executable named sqlite3 that is not a CLI, proving
+          the gate falls back instead of trusting PATH;
         - "real": a symlink to this host's real sqlite3 CLI, for the
           optional test of the unshimmed binary;
         - None: no sqlite3 exists on PATH at all — the hermetic PATH
@@ -179,6 +200,10 @@ class ReleaseGateContractTests(unittest.TestCase):
         if sqlite3_mode == "shim":
             sqlite3_path = tools_dir / "sqlite3"
             sqlite3_path.write_text(SQLITE3_SHIM)
+            sqlite3_path.chmod(0o755)
+        elif sqlite3_mode == "broken":
+            sqlite3_path = tools_dir / "sqlite3"
+            sqlite3_path.write_text("#!/bin/sh\nexit 42\n")
             sqlite3_path.chmod(0o755)
         elif sqlite3_mode == "real":
             os.symlink(shutil.which("sqlite3"), tools_dir / "sqlite3")
@@ -245,7 +270,12 @@ class ReleaseGateContractTests(unittest.TestCase):
 
     def _env(self, backend):
         env = os.environ.copy()
-        sqlite3_mode = {"cli": "shim", "python": None, "real": "real"}[backend]
+        sqlite3_mode = {
+            "cli": "shim",
+            "python": None,
+            "real": "real",
+            "broken": "broken",
+        }[backend]
         env["PATH"] = str(self._hermetic_tools(sqlite3_mode))
         return env
 
@@ -304,8 +334,18 @@ class ReleaseGateContractTests(unittest.TestCase):
         self.assertIn("python3 sqlite3 fallback", results["python"].stderr)
         self.assertNotIn("fallback", results["cli"].stderr)
 
-    @unittest.skipIf(shutil.which("sqlite3") is None,
-                     "the sqlite3 CLI is not installed on this host")
+    def test_incompatible_sqlite3_executable_uses_python_fallback(self):
+        db_path = self._green_db()
+        result = self._run_gate(db_path, "broken")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, EXPECTED_GREEN_STDOUT)
+        self.assertIn("CLI unavailable or incompatible", result.stderr)
+        self.assertIn("python3 sqlite3 fallback", result.stderr)
+
+    @unittest.skipUnless(
+        _has_usable_sqlite3_cli(),
+        "a compatible sqlite3 CLI is not installed on this host",
+    )
     def test_real_sqlite3_cli_when_installed(self):
         # The shimmed tests define the CLI contract; this optional test
         # exercises the gate against the real sqlite3 binary where one is
