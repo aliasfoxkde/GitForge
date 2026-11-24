@@ -1848,9 +1848,7 @@ mod tests {
             "abc123".to_string(),
             TriggerType::Push,
         );
-        let pipeline = make_gated_pipeline(Some(
-            r#"files_changed() > 0"#.to_string(),
-        ));
+        let pipeline = make_gated_pipeline(Some(r#"files_changed() > 0"#.to_string()));
         let engine = CiEngine::new(event, pipeline).await.unwrap();
         engine.start().await.unwrap();
 
@@ -1887,9 +1885,7 @@ mod tests {
             "abc123".to_string(),
             TriggerType::Push,
         );
-        let pipeline = make_gated_pipeline(Some(
-            r#"files_changed() > 0"#.to_string(),
-        ));
+        let pipeline = make_gated_pipeline(Some(r#"files_changed() > 0"#.to_string()));
         let engine = CiEngine::new(event, pipeline).await.unwrap();
         engine.start().await.unwrap();
 
