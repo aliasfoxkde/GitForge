@@ -15,7 +15,7 @@ use gitforge_ci::{
     engine::{fence_actions, FenceAction},
     CiEngine, JobDefinition, PipelineDefinition, PipelineTriggerEvent, StepDefinition, TriggerType,
 };
-use gitforge_common::{PipelineStatus, Result};
+use gitforge_common::PipelineStatus;
 use gitforge_db::models::{Pipeline as DbPipeline, PipelineRun as DbPipelineRun};
 use gitforge_db::queries::persist_with_retry;
 use gitforge_events::{
@@ -2124,7 +2124,7 @@ async fn prepare_run_workspace(
 /// Clean up stale object cache directories for repos that no longer exist.
 /// Scans _objects/<repo_id>/ for dirs whose repo_id is not in the active DB.
 /// Returns the number of stale dirs removed.
-async fn cleanup_stale_object_caches(workspace_root: &std::path::Path) -> Result<usize> {
+async fn cleanup_stale_object_caches(workspace_root: &std::path::Path) -> anyhow::Result<usize> {
     let objects_dir = workspace_root.join("_objects");
     if !objects_dir.is_dir() {
         return Ok(0);
