@@ -15,7 +15,7 @@ use gitforge_ci::{
     engine::{fence_actions, FenceAction},
     CiEngine, JobDefinition, PipelineDefinition, PipelineTriggerEvent, StepDefinition, TriggerType,
 };
-use gitforge_common::PipelineStatus;
+use gitforge_common::{PipelineStatus, Result};
 use gitforge_db::models::{Pipeline as DbPipeline, PipelineRun as DbPipelineRun};
 use gitforge_db::queries::persist_with_retry;
 use gitforge_events::{
