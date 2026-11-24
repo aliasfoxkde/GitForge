@@ -8,7 +8,6 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::process::Command;
 use tokio::sync::RwLock;
-use tokio::time::Duration;
 
 /// CI Engine state
 #[derive(Debug, Clone)]
@@ -268,7 +267,7 @@ pub fn eval_skip_if(skip_if: &Option<String>, env: &HashMap<String, String>) -> 
 }
 
 fn has_disallowed_chars(s: &str) -> bool {
-    s.contains(|c: char| matches!(c, ';' | '`' | '$' | '\\' | '"' | '\''))
+    s.contains([';', '`', '$', '\\', '"', '\''])
 }
 
 fn evaluate_expr(expr: &str, files_changed: u64, env: &HashMap<String, String>) -> Result<bool> {
@@ -408,8 +407,7 @@ fn eval_func(s: &str, files_changed: u64, env: &HashMap<String, String>) -> Resu
                 .unwrap_or(0) as i64)
         }
         other => Err(gitforge_common::Error::invalid_input(format!(
-            "skip_if: unknown function '{}', only files_changed() and path_changed() allowed",
-            other
+            "skip_if: unknown function '{other}', only files_changed() and path_changed() allowed"
         ))),
     }
 }

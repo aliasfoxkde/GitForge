@@ -215,8 +215,7 @@ impl DagBuilder {
         let depth = Self::max_depth(&graph);
         if depth > MAX_PIPELINE_DEPTH {
             return Err(gitforge_common::Error::invalid_input(format!(
-                "pipeline depth {} exceeds limit of {}",
-                depth, MAX_PIPELINE_DEPTH
+                "pipeline depth {depth} exceeds limit of {MAX_PIPELINE_DEPTH}",
             )));
         }
 
