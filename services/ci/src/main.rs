@@ -2144,6 +2144,7 @@ async fn cleanup_stale_object_caches(workspace_root: &std::path::Path) -> anyhow
             active_repos.insert(row);
         }
     }
+    let mut removed = 0;
 
     for entry in objects_dir.read_dir().into_iter().flatten() {
         let entry = entry?;
