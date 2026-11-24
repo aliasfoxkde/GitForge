@@ -226,6 +226,7 @@ pub struct JobDefinition {
     /// unknown-key gate rejects the key outright otherwise. `None` keeps
     /// legacy behavior: the runner executes the steps for real.
     #[serde(default)]
+    pub retry: Option<u8>,
     pub fault: Option<Fault>,
 }
 

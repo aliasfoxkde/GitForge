@@ -282,6 +282,19 @@ impl CasStore {
             .map_err(|e| Error::with_source(ErrorKind::Database, "CAS: sweep commit", e))?;
         Ok(outcome)
     }
+    /// Retrieve a blob's bytes from storage by its hash.
+    ///
+    /// Returns `Error::not_found` if the blob does not exist in storage.
+    pub async fn get(&self, hash: &BlobHash) -> Result<Vec<u8>> {
+        let path = self.blob_path(hash);
+        tokio::fs::read(&path).await.map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                Error::not_found("cas blob", hash)
+            } else {
+                Error::with_source(ErrorKind::Storage, format!("read cas blob {hash}"), e)
+            }
+        })
+    }
 }
 
 #[cfg(test)]
