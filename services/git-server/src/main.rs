@@ -41,7 +41,7 @@ struct AppState {
     ci_trigger_token: Option<String>,
     http_client: reqwest::Client,
     dead_letter_pool: Option<Arc<Pool>>,
-    shutdown_flag: Arc<tokio::sync::atomic::AtomicBool>,
+    shutdown_flag: Arc<AtomicBool>,
     /// Max concurrent retry tasks to prevent unbounded task accumulation.
     retry_limit: Arc<tokio::sync::Semaphore>,
 }
@@ -138,7 +138,7 @@ async fn main() -> anyhow::Result<()> {
     // Create app state
 
     // Shutdown flag for background loops
-    let shutdown_flag = Arc::new(tokio::sync::atomic::AtomicBool::new(false));
+    let shutdown_flag = Arc::new(AtomicBool::new(false));
 
     // Cap concurrent retry tasks to prevent unbounded accumulation during
     // sustained DB outages.
@@ -764,7 +764,7 @@ fn read_dead_letter_max_duration_from_env() -> std::time::Duration {
 /// logged and retried on the next pass — the task never stops the server.
 async fn dead_letter_cleanup_loop(
     pool: Arc<gitforge_db::Pool>,
-    shutdown: Arc<tokio::sync::atomic::AtomicBool>,
+    shutdown: Arc<AtomicBool>,
 ) {
     const PURGE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600); // 1 hour
     const PURGE_AGE: std::time::Duration = std::time::Duration::from_secs(30 * 86400); // 30 days
